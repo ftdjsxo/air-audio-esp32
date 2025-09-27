@@ -26,8 +26,10 @@
 #endif
 
 // ---------- CONFIG ----------
-const char* WIFI_SSID = "AO";
-const char* WIFI_PASS = "L4z1o1!#";
+// No built-in default WiFi credentials present in source.
+// The firmware will only attempt STA connect when valid credentials are stored
+// in Preferences (prefs.getString("ssid","")) or when the captive portal
+// provides credentials via the /save handler (pendingConnect -> WiFi.begin).
 
 #ifndef SERIAL_ENABLED
 #define SERIAL_ENABLED 1
@@ -594,8 +596,10 @@ void setup() {
     SLog("Found saved creds - attempting connect to '%s'\n", storedSsid.c_str());
     WiFi.begin(storedSsid.c_str(), storedPass.c_str());
   } else {
-    SLog("No saved creds - attempting connect to default SSID '%s'\n", WIFI_SSID);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    SLog("No saved creds - default auto-connect disabled (no WIFI_SSID). Waiting for user action or captive AP trigger.\n");
+    // Do not call WiFi.begin() with a built-in default. Connection will only be attempted
+    // when the user presses the D19 button (which starts captive AP and then Save -> connect)
+    // or when credentials are stored in Preferences.
   }
 
   showPot = false;
