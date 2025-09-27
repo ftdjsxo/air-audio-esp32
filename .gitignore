@@ -1,0 +1,23 @@
+# Arduino build artifacts
+build/
+*.bin
+*.elf
+*.hex
+*.eep
+*.map
+
+# Arduino CLI cache
+.cache/
+.tmp/
+
+# VS Code / IDE metadata
+.vscode/
+.idea/
+*.code-workspace
+
+# Mac / Windows noise
+.DS_Store
+Thumbs.db
+
+# Logs and diagnostics
+*.log
