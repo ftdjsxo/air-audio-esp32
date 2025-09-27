@@ -15,14 +15,12 @@
 #include "freertos/queue.h"
 #include <stdarg.h>
 #include <string.h>
-#include "captive_pages.h"
 
 #include "sample_data.h"
 #include "led_renderer.h"
 #include "led_config.h"
+#include "wifi_captive.h"
 
-#include <WebServer.h>
-#include <DNSServer.h>
 #include <Preferences.h>
 
 #if defined(ARDUINO_ARCH_ESP32)
@@ -40,7 +38,7 @@
 #endif
 
 #if SERIAL_ENABLED
-static void SLog(const char *fmt, ...) {
+void SLog(const char *fmt, ...) {
   char _slog_buf[256];
   va_list args;
   va_start(args, fmt);
@@ -49,7 +47,7 @@ static void SLog(const char *fmt, ...) {
   Serial.print(_slog_buf);
 }
 #else
-static inline void SLog(const char *fmt, ...) { (void)fmt; }
+inline void SLog(const char *fmt, ...) { (void)fmt; }
 #endif
 
 // ---------- CPU frequency scaling (idle cooling) ----------
@@ -61,7 +59,7 @@ static inline void SLog(const char *fmt, ...) { (void)fmt; }
 #endif
 
 static int currentCpuMhz = 0;
-static volatile unsigned long lastCpuBoostTime = 0;
+volatile unsigned long lastCpuBoostTime = 0;
 const unsigned long IDLE_CPU_TIMEOUT_MS = 3000UL; // after this of no boost-worthy activity, lower CPU
 
 // --- FIX --- rate-limit CPU freq changes to avoid rapid toggles that destabilize Wi-Fi driver
@@ -85,6 +83,14 @@ static inline void setCpuIfNeeded(int mhz) {
 #else
   (void)mhz;
 #endif
+}
+
+void requestCpuNormal() {
+  setCpuIfNeeded(NORMAL_CPU_MHZ);
+}
+
+void requestCpuIdle() {
+  setCpuIfNeeded(MIN_IDLE_CPU_MHZ);
 }
 
 // LED pins
@@ -129,23 +135,12 @@ const unsigned long BACKOFF_RECOVERY_MS = 5000;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 10000;
 const unsigned long GREEN_SHOW_MS = 500;
 
-// captive AP config
-const char *CAPTIVE_AP_SSID = "Air Volume";
-const byte DNS_PORT = 53;
-const unsigned long CONNECT_TRY_TIMEOUT_MS = 10000; // time to wait for STA connect after form submit
-
-// --- nuovo: ritardo prima di attivare captive AP dopo perdita STA
-static unsigned long staDisconnectAt = 0;
-const unsigned long STA_TO_CAPTIVE_DELAY_MS = CONNECT_TRY_TIMEOUT_MS; // default 10s
-
 // BUTTON (D19)
 #define BUTTON_PIN 19
 const unsigned long BUTTON_DEBOUNCE_MS = 50;
 
 // servers
 WiFiServer wsServer(81);
-WebServer captiveServer(80);
-DNSServer dnsServer;
 Preferences prefs;
 
 // state (simple volatile flags)
@@ -198,13 +193,6 @@ struct DeltaEntry { unsigned long ts; int delta; };
 DeltaEntry history[HISTORY_SIZE];
 int historyHead = 0;
 int historyCount = 0;
-
-// ---------- captive state ----------
-bool apActive = false;
-bool pendingConnect = false;
-char pendingSSID[64] = "";
-char pendingPASS[64] = "";
-unsigned long connectAttemptStart = 0;
 
 // ---------- helpers ----------
 static inline void base64_encode_static(const uint8_t *data, size_t len, char *out, size_t outlen) {
@@ -402,57 +390,6 @@ void samplingTask(void *pv) {
   }
 }
 
-// ---------- captive helper functions ----------
-void startCaptiveAP() {
-  if (apActive) return;
-  SLog("Starting captive AP '%s'\n", CAPTIVE_AP_SSID);
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(CAPTIVE_AP_SSID); // open AP
-  delay(50);
-  IPAddress apIP = WiFi.softAPIP(); // usually 192.168.4.1
-  dnsServer.start(DNS_PORT, "*", apIP);
-  captiveServer.on("/", []() {
-    captiveServer.send(200, "text/html", CAPTIVE_PAGE_FORM);
-  });
-  captiveServer.on("/save", []() {
-    String ssid = captiveServer.arg("ssid");
-    String pass = captiveServer.arg("pass");
-    if (ssid.length() < 1) {
-      captiveServer.send(400, "text/plain", "Missing SSID");
-      return;
-    }
-    prefs.putString("ssid", ssid);
-    prefs.putString("pass", pass);
-    SLog("Saved credentials to Preferences (ssid='%s')\n", ssid.c_str());
-    ssid.toCharArray(pendingSSID, sizeof(pendingSSID));
-    pass.toCharArray(pendingPASS, sizeof(pendingPASS));
-    pendingConnect = true;
-    captiveServer.send(200, "text/html", CAPTIVE_PAGE_CONNECTING);
-  });
-  captiveServer.on("/forget", []() {
-    prefs.remove("ssid");
-    prefs.remove("pass");
-    SLog("Cleared saved credentials from Preferences\n");
-    captiveServer.send(200, "text/html", CAPTIVE_PAGE_FORGOTTEN);
-  });
-  captiveServer.onNotFound([](){
-    captiveServer.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
-    captiveServer.send(302, "text/plain", "");
-  });
-  captiveServer.begin();
-  apActive = true;
-}
-
-void stopCaptiveAP() {
-  if (!apActive) return;
-  SLog("Stopping captive AP\n");
-  dnsServer.stop();
-  captiveServer.stop();
-  WiFi.softAPdisconnect(true);
-  delay(50);
-  apActive = false;
-}
-
 // ---------- setup ----------
 void setup() {
   #if SERIAL_ENABLED
@@ -573,13 +510,13 @@ void loop() {
 
         // try disconnect and clear any ongoing STA connection
         WiFi.disconnect(true);
-        pendingConnect = false;
+        wifiClearPendingConnect();
 
         // ensure captive AP is started (explicit user action -> immediate AP)
         startCaptiveAP();
 
         // lower CPU for idle captive mode
-        setCpuIfNeeded(MIN_IDLE_CPU_MHZ);
+        requestCpuIdle();
 
         // show captive/pot UI as appropriate
         showPot = false;
@@ -588,7 +525,7 @@ void loop() {
         connectedAt = 0;
 
         // reset spontaneous disconnect timer because user forced AP
-        staDisconnectAt = 0;
+        wifiResetStaGraceTimer();
       }
 
       // reset handled flag when released (so next press triggers again)
@@ -600,53 +537,7 @@ void loop() {
   }
   // --- end button handling ---
 
-  // cache wifi state to avoid repeated calls
-  wl_status_t wifiSt = WiFi.status();
-
-  // --- comportamento corretto per apertura captive AP dopo grace period ---
-  if (wifiSt == WL_CONNECTED) {
-    // Connected: clear spontaneous disconnect timer; if AP active stop it
-    staDisconnectAt = 0;
-    if (apActive) stopCaptiveAP();
-    if (!showPot && (now - connectedAt >= GREEN_SHOW_MS)) {
-      showPot = true;
-      SLog("Switching to POT display mode\n");
-    }
-    connectedAt = connectedAt == 0 ? now : connectedAt;
-  } else {
-    // Not connected
-    // If an explicit connect attempt is ongoing, don't start AP (connectAttemptStart will manage timeouts)
-    if (connectAttemptStart != 0) {
-      // leave it to connectAttemptStart handling (do not enable AP)
-      staDisconnectAt = 0;
-    } else {
-      // spontaneous loss: start a grace period before enabling captive AP
-      if (!apActive && !pendingConnect) {
-        if (staDisconnectAt == 0) {
-          staDisconnectAt = now;
-          SLog("STA lost: will wait %lums before enabling captive AP\n", STA_TO_CAPTIVE_DELAY_MS);
-        } else {
-          if (now - staDisconnectAt >= STA_TO_CAPTIVE_DELAY_MS) {
-            SLog("STA loss grace expired -> starting captive AP\n");
-            startCaptiveAP();
-            setCpuIfNeeded(MIN_IDLE_CPU_MHZ);
-            // reset the timer
-            staDisconnectAt = 0;
-          }
-        }
-      } else {
-        // If AP is active or pendingConnect true hold/reset the timer
-        staDisconnectAt = 0;
-      }
-    }
-  }
-  // --- fine modifica ---
-
-  // DNS & captive server handling when AP is active (only when active)
-  if (apActive) {
-    dnsServer.processNextRequest();
-    captiveServer.handleClient();
-  }
+  wifiManageState(now);
 
   // accept new TCP clients (non-blocking) - DO NOT boost CPU here (avoid probes)
   WiFiClient newClient = wsServer.available();
@@ -716,52 +607,6 @@ void loop() {
       }
     } else if (c && !c.connected()) {
       c.stop(); wsHandshakeDone[i] = false; hsLen[i] = 0; wsHasPending[i] = false;
-    }
-  }
-
-  // refresh wifiSt (some operations may have changed status above)
-  wifiSt = WiFi.status();
-  if (wifiSt == WL_CONNECTED) {
-    if (!showPot && (now - connectedAt >= GREEN_SHOW_MS)) {
-      showPot = true;
-      SLog("Switching to POT display mode\n");
-    }
-    connectedAt = connectedAt == 0 ? now : connectedAt;
-  }
-
-  // Handle pending connect requested from captive portal (non-blocking)
-  if (pendingConnect) {
-    // ensure captive AP is stopped **before** attempting STA connect
-    if (apActive) {
-      stopCaptiveAP();
-      delay(50);
-    }
-    SLog("Attempting STA connect to SSID='%s'\n", pendingSSID);
-    setCpuIfNeeded(NORMAL_CPU_MHZ);
-    lastCpuBoostTime = now;
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(pendingSSID, pendingPASS);
-    connectAttemptStart = now;
-    pendingConnect = false;
-    pendingSSID[0] = '\0'; pendingPASS[0] = '\0';
-    // reset spontaneous disconnect timer because we're actively attempting
-    staDisconnectAt = 0;
-  }
-
-  // monitor ongoing connection attempt (non-blocking)
-  if (connectAttemptStart != 0) {
-    wl_status_t st = WiFi.status();
-    if (st == WL_CONNECTED) {
-      SLog("STA connect success\n");
-      connectAttemptStart = 0;
-      apActive = false;
-    } else {
-      if (now - connectAttemptStart >= CONNECT_TRY_TIMEOUT_MS) {
-        SLog("STA connect timeout, re-enabling captive AP\n");
-        connectAttemptStart = 0;
-        startCaptiveAP();
-        setCpuIfNeeded(MIN_IDLE_CPU_MHZ);
-      }
     }
   }
 
@@ -853,9 +698,9 @@ void loop() {
 
   // automatic CPU downscale if we were boosted but nothing relevant happened for a while
   if (currentCpuMhz > MIN_IDLE_CPU_MHZ) {
-    bool safeToLower = !interacting && !apActive && !pendingConnect;
+    bool safeToLower = !interacting && !wifiIsCaptiveActive() && !wifiHasPendingConnect();
     if (safeToLower && (now - lastCpuBoostTime >= IDLE_CPU_TIMEOUT_MS)) {
-      setCpuIfNeeded(MIN_IDLE_CPU_MHZ);
+      requestCpuIdle();
     }
   }
 
@@ -867,9 +712,9 @@ void loop() {
       SLog("mode=%s act=%.4f bcast=%lums bwcnt=%d backoff=%d raw=%d v=%.3f pct=%.1f showPot=%d apActive=%d cpu=%d\n",
            interacting ? "INTERACT" : "IDLE",
            latest.activity, broadcastInterval, broadcastCountWindow, inBackoff?1:0,
-           latest.raw, latest.voltage, latest.percent, showPot?1:0, apActive?1:0, currentCpuMhz);
+           latest.raw, latest.voltage, latest.percent, showPot?1:0, wifiIsCaptiveActive()?1:0, currentCpuMhz);
     } else {
-      SLog("no sample yet apActive=%d cpu=%d\n", apActive?1:0, currentCpuMhz);
+      SLog("no sample yet apActive=%d cpu=%d\n", wifiIsCaptiveActive()?1:0, currentCpuMhz);
     }
   }
 
