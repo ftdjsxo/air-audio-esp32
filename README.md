@@ -1,6 +1,6 @@
 # sketch_sep26a
 
-Firmware per un nodo sensore interattivo "Air Volume" basato su ESP32-WROOM-32D. Il programma campiona un potenziometro, pilota un LED RGB tramite il periferico PWM LEDC e pubblica le letture via Wi-Fi attraverso un captive portal e un feed WebSocket. La logica è ottimizzata per restare reattiva senza mettere in difficoltà il driver radio grazie a un controllo attento della frequenza della CPU e dell'I/O.
+Firmware per un nodo sensore interattivo "Air Volume" basato su ESP32-WROOM-32D. Il programma campiona un potenziometro, pilota un LED RGB tramite il periferico PWM LEDC e pubblica le letture via Wi-Fi attraverso un captive portal e un feed WebSocket. Include un servizio di autodiscovery UDP che annuncia la presenza del dispositivo sulla rete locale. La logica è ottimizzata per restare reattiva senza mettere in difficoltà il driver radio grazie a un controllo attento della frequenza della CPU e dell'I/O.
 
 ## Componenti necessari
 - Modulo ESP32-WROOM-32D (o DevKitC che lo monta), con supporto dual core e LEDC
@@ -44,6 +44,7 @@ Firmware per un nodo sensore interattivo "Air Volume" basato su ESP32-WROOM-32D.
 - `led_renderer.cpp/.h`: task dedicato al rendering LED, consuma i campioni dalla coda e mostra stato Wi-Fi o la percentuale del potenziometro.
 - `wifi_captive.cpp/.h`: gestisce captive portal, timer di grazia e tentativi STA, isolando le chiamate a `WiFi`, `DNSServer` e `WebServer` dal loop principale.
 - `ws_manager.cpp/.h`: incapsula il server WebSocket sulla porta 81, curando handshake, buffering non bloccante e disconnessioni automatiche in caso di backpressure o timeout.
+- `discovery_service.cpp/.h`: mantiene il ciclo di autodiscovery via UDP (porta 4210), annunciando la presenza sulla rete e rispondendo ai broadcast di ricerca del client.
 - `sample_data.h` e `led_config.h`: header di condivisione per la coda dei campioni e per le costanti LEDC.
 - `captive_pages.h`: template HTML serviti dal captive portal.
 ### Sequenza di boot (`setup`)
@@ -85,6 +86,29 @@ Firmware per un nodo sensore interattivo "Air Volume" basato su ESP32-WROOM-32D.
 ### Diagnostica
 - `SLog` invia circa ogni 800 ms una riga compatta con modalità attuale, attività, intervallo di broadcast, frequenza CPU, stato LED e connessione: utile per il debug via seriale.
 
+## Autodiscovery e integrazione client
+Il firmware espone un servizio di autodiscovery sulla porta UDP `4210`:
+- **Annuncio automatico:** quando l'ESP32 si connette alla rete Wi-Fi invia tre pacchetti `announce` distanziati di ~400 ms, poi ripete l'annuncio ogni 30 s finché resta online.
+- **Risposte on-demand:** qualsiasi pacchetto broadcast sulla stessa porta che contenga le parole chiave `airvol` e `discover` (case insensitive) riceve una risposta `response` indirizzata all'IP/porta sorgente.
+- **Formato JSON:**
+  ```json
+  {
+    "type": "announce" | "response",
+    "service": "airvol",
+    "id": "airvol-XXXXXXXXXXXX",
+    "ip": "192.168.1.50",
+    "ws_port": 81
+  }
+  ```
+  `id` deriva dal MAC e rimane stabile per il dispositivo. `ws_port` indica la porta WebSocket esposta dallo sketch.
+
+### Guida rapida per il client
+1. Crea un socket UDP (IPv4) con broadcast abilitato e invia all'indirizzo `255.255.255.255:4210` il JSON `{"type":"discover","service":"airvol"}`.
+2. Metti il socket in ascolto: riceverai sia gli `announce` periodici sia le `response` in risposta alla tua ricerca.
+3. Valida il campo `service` e usa `ip`/`ws_port` per costruire l'endpoint `ws://<ip>:<ws_port>/` (un path generico come `/ws` funziona).
+4. Stabilita la connessione WebSocket, consuma i payload broadcast dal firmware (non è richiesto handshake applicativo aggiuntivo).
+5. Ripeti il discover ogni 30–60 s oppure considera il dispositivo offline se non ricevi `announce` per oltre 60 s.
+
 ## Struttura della cartella
 ```
 .
@@ -94,6 +118,7 @@ Firmware per un nodo sensore interattivo "Air Volume" basato su ESP32-WROOM-32D.
 ├── led_renderer.cpp/.h     # task LED e helper
 ├── wifi_captive.cpp/.h     # gestione Wi-Fi/captive portal
 ├── ws_manager.cpp/.h       # server WebSocket (handshake, buffering, drop)
+├── discovery_service.cpp/.h# autodiscovery UDP
 ├── led_config.h            # costanti LEDC condivise
 ├── sample_data.h           # struct Sample_t + coda FreeRTOS
 └── captive_pages.h         # frammenti HTML per il captive portal

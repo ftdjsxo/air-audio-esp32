@@ -16,7 +16,7 @@ constexpr size_t HS_BUF_SZ = 600;
 constexpr unsigned long WS_PENDING_STALL_MS = 6000UL;
 constexpr unsigned long WS_HANDSHAKE_TIMEOUT_MS = 4000UL;
 
-WiFiServer wsServer(81);
+WiFiServer wsServer(WS_SERVER_PORT);
 WiFiClient wsClients[WS_MAX_CLIENTS];
 bool wsHandshakeDone[WS_MAX_CLIENTS];
 char hsBuf[WS_MAX_CLIENTS][HS_BUF_SZ];
@@ -315,4 +315,3 @@ void wsDropAllClients() {
 unsigned long wsGetLastClientActivity() {
   return wsLastClientActivity;
 }
-

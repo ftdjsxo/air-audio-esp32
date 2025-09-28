@@ -21,6 +21,7 @@
 #include "wifi_captive.h"
 #include "ws_manager.h"
 #include "power_manager.h"
+#include "discovery_service.h"
 
 #include <Preferences.h>
 
@@ -145,7 +146,7 @@ static unsigned long buttonPressStartMs = 0;
 static bool buttonLongActionTriggered = false;
 
 // servers
-WiFiServer wsServer(81);
+WiFiServer wsServer(WS_SERVER_PORT);
 Preferences prefs;
 
 // state (simple volatile flags)
@@ -215,6 +216,7 @@ void setup() {
   powerManagerSetup(initNow, IDLE_BROAD_MS);
 
   wsInit();
+  discoverySetup();
 
   WiFi.setSleep(false);
 
@@ -274,6 +276,7 @@ void loop() {
   }
 
   powerManagerTick(now);
+  discoveryTick(now);
 
   bool powered = powerIsOn();
   static bool offLogged = false;
