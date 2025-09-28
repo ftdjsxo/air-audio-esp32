@@ -135,6 +135,15 @@ const unsigned long GREEN_SHOW_MS = 500;
 // BUTTON (D19)
 #define BUTTON_PIN 19
 const unsigned long BUTTON_DEBOUNCE_MS = 50;
+const unsigned long BUTTON_LONG_PRESS_MS = 3000;
+
+volatile bool devicePowered = true;
+
+static int buttonReading = HIGH;
+static int buttonStableState = HIGH;
+static unsigned long lastButtonChangeMs = 0;
+static unsigned long buttonPressStartMs = 0;
+static bool buttonLongActionTriggered = false;
 
 // servers
 WiFiServer wsServer(81);
@@ -145,10 +154,7 @@ volatile bool showPot = false;
 volatile unsigned long connectedAt = 0;
 volatile bool interacting = false;
 
-// button state (debounce)
-static int lastButtonState = HIGH;            // INPUT_PULLUP => HIGH when not pressed
-static unsigned long lastButtonChangeMs = 0;
-static bool buttonHandled = false;
+// button state handled via buttonReading/buttonStableState
 
 // ---------- sample single-slot queue ----------
 QueueHandle_t sampleQueue = NULL;
@@ -169,6 +175,84 @@ unsigned long broadcastWindowStart = 0;
 bool inBackoff = false;
 unsigned long backoffStart = 0;
 
+void forceAllLedsOff() {
+  ledc_set_duty(LEDC_MODE, GREEN_CH, 0);
+  ledc_update_duty(LEDC_MODE, GREEN_CH);
+  ledc_set_duty(LEDC_MODE, BLUE_CH, 0);
+  ledc_update_duty(LEDC_MODE, BLUE_CH);
+  ledc_set_duty(LEDC_MODE, RED_CH, 0);
+  ledc_update_duty(LEDC_MODE, RED_CH);
+}
+
+void resetRuntimeState(unsigned long now) {
+  showPot = false;
+  connectedAt = 0;
+  interacting = false;
+  lastInteractionMillis = now;
+  interactingSince = 0;
+  broadcastInterval = IDLE_BROAD_MS;
+  lastBroadcastTime = now;
+  lastBroadcastRaw = 0;
+  broadcastWindowStart = now;
+  broadcastCountWindow = 0;
+  inBackoff = false;
+  backoffStart = 0;
+}
+
+void connectFromStoredCredentials(unsigned long now) {
+  String storedSsid = prefs.getString("ssid", "");
+  String storedPass = prefs.getString("pass", "");
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  if (storedSsid.length() > 0) {
+    SLog("Connecting to saved network '%s'\n", storedSsid.c_str());
+    WiFi.begin(storedSsid.c_str(), storedPass.c_str());
+    wifiRegisterStaAttempt(now);
+  } else {
+    SLog("No saved credentials - waiting for captive portal\n");
+  }
+}
+
+void devicePowerOff(unsigned long now) {
+  if (!devicePowered) return;
+  SLog("Device powering OFF\n");
+  devicePowered = false;
+  resetRuntimeState(now);
+  wsDropAllClients();
+  wifiClearPendingConnect();
+  wifiResetStaGraceTimer();
+  stopCaptiveAP();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  requestCpuIdle();
+  forceAllLedsOff();
+}
+
+void devicePowerOn(unsigned long now) {
+  if (devicePowered) return;
+  SLog("Device powering ON\n");
+  devicePowered = true;
+  resetRuntimeState(now);
+  wifiClearPendingConnect();
+  wifiResetStaGraceTimer();
+  requestCpuNormal();
+  lastCpuBoostTime = now;
+  connectFromStoredCredentials(now);
+}
+
+void handleCaptiveLongPress(unsigned long now) {
+  if (!devicePowered) return;
+  SLog("Button D19 long press -> starting captive portal\n");
+  prefs.remove("ssid");
+  prefs.remove("pass");
+  WiFi.disconnect(true);
+  wifiClearPendingConnect();
+  stopCaptiveAP();
+  startCaptiveAP();
+  requestCpuIdle();
+  resetRuntimeState(now);
+  wifiResetStaGraceTimer();
+}
 
 // ---------- setup ----------
 void setup() {
@@ -207,22 +291,9 @@ void setup() {
 
   startSamplingTask();
 
-  String storedSsid = prefs.getString("ssid", "");
-  String storedPass = prefs.getString("pass", "");
-  WiFi.mode(WIFI_STA);
-  if (storedSsid.length() > 0) {
-    SLog("Found saved creds - attempting connect to '%s'\n", storedSsid.c_str());
-    WiFi.begin(storedSsid.c_str(), storedPass.c_str());
-    wifiRegisterStaAttempt(millis());
-  } else {
-    SLog("No saved creds - default auto-connect disabled (no WIFI_SSID). Waiting for user action or captive AP trigger.\n");
-    // Do not call WiFi.begin() with a built-in default. Connection will only be attempted
-    // when the user presses the D19 button (which starts captive AP and then Save -> connect)
-    // or when credentials are stored in Preferences.
-  }
-
-  showPot = false;
-  connectedAt = 0;
+  unsigned long initNow = millis();
+  resetRuntimeState(initNow);
+  connectFromStoredCredentials(initNow);
 
   wsInit();
 
@@ -230,9 +301,12 @@ void setup() {
 
   // button init (D19) - INPUT_PULLUP, button closes to GND when pressed
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  lastButtonState = digitalRead(BUTTON_PIN);
+  int initialButton = digitalRead(BUTTON_PIN);
+  buttonReading = initialButton;
+  buttonStableState = initialButton;
   lastButtonChangeMs = millis();
-  buttonHandled = false;
+  buttonPressStartMs = 0;
+  buttonLongActionTriggered = false;
 
   // ledTask su core 1 per evitare contention con Wi-Fi (core 0)
   xTaskCreatePinnedToCore(ledTask, "led", 3072, NULL, 3, NULL, 1);        // med prio -> core 1
@@ -248,151 +322,143 @@ const int MAX_HS_READ_PER_ITER = 128;
 void loop() {
   unsigned long now = millis();
 
-  // --- button handling (D19) ---
-  {
-    int btn = digitalRead(BUTTON_PIN); // HIGH = released, LOW = pressed (pullup)
-    if (btn != lastButtonState) {
-      lastButtonChangeMs = now;
-      lastButtonState = btn;
-    } else {
-      // stable state for debounce interval
-      if (btn == LOW && !buttonHandled && (now - lastButtonChangeMs) >= BUTTON_DEBOUNCE_MS) {
-        // Button pressed: forget wifi and start captive AP
-        buttonHandled = true;
-        SLog("Button D19 pressed -> forgetting WiFi and starting captive AP\n");
+  int reading = digitalRead(BUTTON_PIN);
+  if (reading != buttonReading) {
+    lastButtonChangeMs = now;
+    buttonReading = reading;
+  }
 
-        // remove saved creds
-        prefs.remove("ssid");
-        prefs.remove("pass");
-
-        // try disconnect and clear any ongoing STA connection
-        WiFi.disconnect(true);
-        wifiClearPendingConnect();
-
-        // ensure captive AP is started (explicit user action -> immediate AP)
-        startCaptiveAP();
-
-        // lower CPU for idle captive mode
-        requestCpuIdle();
-
-        // show captive/pot UI as appropriate
-        showPot = false;
-
-        // reset some runtime state to be safe
-        connectedAt = 0;
-
-        // reset spontaneous disconnect timer because user forced AP
-        wifiResetStaGraceTimer();
-      }
-
-      // reset handled flag when released (so next press triggers again)
-      if (btn == HIGH && buttonHandled) {
-        buttonHandled = false;
+  if ((now - lastButtonChangeMs) >= BUTTON_DEBOUNCE_MS) {
+    if (buttonReading != buttonStableState) {
+      buttonStableState = buttonReading;
+      if (buttonStableState == LOW) {
+        buttonPressStartMs = now;
+        buttonLongActionTriggered = false;
+      } else {
+        if (!buttonLongActionTriggered) {
+          if (devicePowered) {
+            devicePowerOff(now);
+          } else {
+            devicePowerOn(now);
+          }
+        }
+        buttonPressStartMs = 0;
         SLog("Button D19 released -> ready for next press\n");
       }
     }
-  }
-  // --- end button handling ---
 
-  wifiManageState(now);
-
-  wsTick(now);
-
-  // Fetch latest sample (peek single-slot queue)
-  Sample_t latest;
-  bool haveSample = false;
-  if (sampleQueue && xQueuePeek(sampleQueue, &latest, 0) == pdTRUE) haveSample = true;
-
-  // update interacting state based on activity + lastInteractionMillis
-  if (haveSample) {
-    if (!interacting && latest.activity >= ACTIVITY_MIN_FOR_INTERACT) {
-      interacting = true;
-      interactingSince = now;
-      broadcastInterval = INTERACT_BROAD_MS;
-      SLog("Switched to INTERACT mode\n");
-      requestCpuNormal();
-      lastCpuBoostTime = now;
-    } else if (interacting) {
-      if ((now - lastInteractionMillis) > INTERACT_SUSTAIN_MS) {
-        if ((now - interactingSince) > INTERACT_MAX_MS) {
-          interacting = false;
-          broadcastInterval = IDLE_BROAD_MS;
-          SLog("Interact max timeout -> switch to IDLE\n");
-          requestCpuIdle();
-        } else {
-          interacting = false;
-          broadcastInterval = IDLE_BROAD_MS;
-          SLog("Sustain expired -> switch to IDLE\n");
-          requestCpuIdle();
-        }
-      }
+    if (buttonStableState == LOW && !buttonLongActionTriggered &&
+        devicePowered && (now - buttonPressStartMs) >= BUTTON_LONG_PRESS_MS) {
+      buttonLongActionTriggered = true;
+      handleCaptiveLongPress(now);
     }
   }
 
-  // Broadcast logic (use latest sample)
-  if (haveSample) {
-    if (now - lastBroadcastTime >= broadcastInterval) {
-      int potRaw = latest.raw;
-      float activity = latest.activity;
-      int deltaSinceLastBroadcast = abs(potRaw - lastBroadcastRaw);
-      int adaptiveThreshold = BASE_BROADCAST_THRESHOLD_RAW + (int)((1.0f - activity) * 20.0f);
-      if (adaptiveThreshold < 1) adaptiveThreshold = 1;
-      bool significant = (deltaSinceLastBroadcast >= adaptiveThreshold);
-      bool heartbeat = (now - lastBroadcastTime) >= (IDLE_BROAD_MS * 2);
+  bool powered = devicePowered;
+  static bool offLogged = false;
 
-      if (significant || heartbeat) {
-        lastBroadcastTime = now;
-        lastBroadcastRaw = potRaw;
+  if (powered) {
+    offLogged = false;
 
-        if (now - broadcastWindowStart >= (unsigned long)BROADCAST_WINDOW_MS) {
-          broadcastWindowStart = now;
-          broadcastCountWindow = 0;
-          if (inBackoff && (now - backoffStart >= BACKOFF_RECOVERY_MS)) {
-            inBackoff = false;
-            broadcastInterval = interacting ? INTERACT_BROAD_MS : IDLE_BROAD_MS;
-            SLog("Backoff recovered\n");
+    wifiManageState(now);
+
+    wsTick(now);
+
+    Sample_t latest;
+    bool haveSample = false;
+    if (sampleQueue && xQueuePeek(sampleQueue, &latest, 0) == pdTRUE) haveSample = true;
+
+    if (haveSample) {
+      if (!interacting && latest.activity >= ACTIVITY_MIN_FOR_INTERACT) {
+        interacting = true;
+        interactingSince = now;
+        broadcastInterval = INTERACT_BROAD_MS;
+        SLog("Switched to INTERACT mode\n");
+        requestCpuNormal();
+        lastCpuBoostTime = now;
+      } else if (interacting) {
+        if ((now - lastInteractionMillis) > INTERACT_SUSTAIN_MS) {
+          if ((now - interactingSince) > INTERACT_MAX_MS) {
+            interacting = false;
+            broadcastInterval = IDLE_BROAD_MS;
+            SLog("Interact max timeout -> switch to IDLE\n");
+            requestCpuIdle();
+          } else {
+            interacting = false;
+            broadcastInterval = IDLE_BROAD_MS;
+            SLog("Sustain expired -> switch to IDLE\n");
+            requestCpuIdle();
           }
         }
-
-        broadcastCountWindow++;
-        if (!inBackoff && broadcastCountWindow > BROADCAST_MAX_PER_WINDOW) {
-          inBackoff = true;
-          backoffStart = now;
-          broadcastInterval = (unsigned long)((float)broadcastInterval * BACKOFF_FACTOR);
-          if (broadcastInterval > (IDLE_BROAD_MS * 4)) broadcastInterval = IDLE_BROAD_MS * 4;
-          SLog("Entering backoff\n");
-        }
-
-        char payload[160];
-        int plen = snprintf(payload, sizeof(payload),
-                    "{\"raw\":%d,\"voltage\":%.4f,\"percent\":%.3f,\"activity\":%.4f}",
-                    latest.raw, latest.voltage, latest.percent, latest.activity);
-
-        wsBroadcastPayload(now, payload, (size_t)plen);
       }
     }
-  }
 
-
-  // automatic CPU downscale if we were boosted but nothing relevant happened for a while
-  if (currentCpuMhz > MIN_IDLE_CPU_MHZ) {
-    bool safeToLower = !interacting && !wifiIsCaptiveActive() && !wifiHasPendingConnect();
-    if (safeToLower && (now - lastCpuBoostTime >= IDLE_CPU_TIMEOUT_MS)) {
-      requestCpuIdle();
-    }
-  }
-
-  // minimal serial status (infrequent)
-  static unsigned long lastSerial = 0;
-  if (now - lastSerial >= 800) {
-    lastSerial = now;
     if (haveSample) {
-      SLog("mode=%s act=%.4f bcast=%lums bwcnt=%d backoff=%d raw=%d v=%.3f pct=%.1f showPot=%d apActive=%d cpu=%d\n",
-           interacting ? "INTERACT" : "IDLE",
-           latest.activity, broadcastInterval, broadcastCountWindow, inBackoff?1:0,
-           latest.raw, latest.voltage, latest.percent, showPot?1:0, wifiIsCaptiveActive()?1:0, currentCpuMhz);
-    } else {
-      SLog("no sample yet apActive=%d cpu=%d\n", wifiIsCaptiveActive()?1:0, currentCpuMhz);
+      if (now - lastBroadcastTime >= broadcastInterval) {
+        int potRaw = latest.raw;
+        float activity = latest.activity;
+        int deltaSinceLastBroadcast = abs(potRaw - lastBroadcastRaw);
+        int adaptiveThreshold = BASE_BROADCAST_THRESHOLD_RAW + (int)((1.0f - activity) * 20.0f);
+        if (adaptiveThreshold < 1) adaptiveThreshold = 1;
+        bool significant = (deltaSinceLastBroadcast >= adaptiveThreshold);
+        bool heartbeat = (now - lastBroadcastTime) >= (IDLE_BROAD_MS * 2);
+
+        if (significant || heartbeat) {
+          lastBroadcastTime = now;
+          lastBroadcastRaw = potRaw;
+
+          if (now - broadcastWindowStart >= (unsigned long)BROADCAST_WINDOW_MS) {
+            broadcastWindowStart = now;
+            broadcastCountWindow = 0;
+            if (inBackoff && (now - backoffStart >= BACKOFF_RECOVERY_MS)) {
+              inBackoff = false;
+              broadcastInterval = interacting ? INTERACT_BROAD_MS : IDLE_BROAD_MS;
+              SLog("Backoff recovered\n");
+            }
+          }
+
+          broadcastCountWindow++;
+          if (!inBackoff && broadcastCountWindow > BROADCAST_MAX_PER_WINDOW) {
+            inBackoff = true;
+            backoffStart = now;
+            broadcastInterval = (unsigned long)((float)broadcastInterval * BACKOFF_FACTOR);
+            if (broadcastInterval > (IDLE_BROAD_MS * 4)) broadcastInterval = IDLE_BROAD_MS * 4;
+            SLog("Entering backoff\n");
+          }
+
+          char payload[160];
+          int plen = snprintf(payload, sizeof(payload),
+                              "{\"raw\":%d,\"voltage\":%.4f,\"percent\":%.3f,\"activity\":%.4f}",
+                              latest.raw, latest.voltage, latest.percent, latest.activity);
+
+          wsBroadcastPayload(now, payload, (size_t)plen);
+        }
+      }
+    }
+
+    if (currentCpuMhz > MIN_IDLE_CPU_MHZ) {
+      bool safeToLower = !interacting && !wifiIsCaptiveActive() && !wifiHasPendingConnect();
+      if (safeToLower && (now - lastCpuBoostTime >= IDLE_CPU_TIMEOUT_MS)) {
+        requestCpuIdle();
+      }
+    }
+
+    static unsigned long lastSerial = 0;
+    if (now - lastSerial >= 800) {
+      lastSerial = now;
+      if (haveSample) {
+        SLog("mode=%s act=%.4f bcast=%lums bwcnt=%d backoff=%d raw=%d v=%.3f pct=%.1f showPot=%d apActive=%d cpu=%d\n",
+             interacting ? "INTERACT" : "IDLE",
+             latest.activity, broadcastInterval, broadcastCountWindow, inBackoff ? 1 : 0,
+             latest.raw, latest.voltage, latest.percent, showPot ? 1 : 0, wifiIsCaptiveActive() ? 1 : 0, currentCpuMhz);
+      } else {
+        SLog("no sample yet apActive=%d cpu=%d\n", wifiIsCaptiveActive() ? 1 : 0, currentCpuMhz);
+      }
+    }
+  } else {
+    if (!offLogged) {
+      SLog("Device is OFF - short press to power ON\n");
+      offLogged = true;
     }
   }
 

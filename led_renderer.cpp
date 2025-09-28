@@ -11,6 +11,7 @@
 #include "led_config.h"
 
 extern volatile bool showPot;
+extern volatile bool devicePowered;
 
 namespace {
 constexpr unsigned long RED_FADE_UPDATE_MS = 40;
@@ -39,9 +40,27 @@ void ledTask(void *pv) {
   (void)pv;
   unsigned long lastRed = 0;
   unsigned long lastBlue = 0;
+  bool ledsCleared = false;
 
   for (;;) {
     unsigned long now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    bool powered = devicePowered;
+
+    if (!powered) {
+      if (!ledsCleared) {
+        ledc_set_duty(LEDC_MODE, GREEN_CH, 0);
+        ledc_update_duty(LEDC_MODE, GREEN_CH);
+        ledc_set_duty(LEDC_MODE, BLUE_CH, 0);
+        ledc_update_duty(LEDC_MODE, BLUE_CH);
+        ledc_set_duty(LEDC_MODE, RED_CH, 0);
+        ledc_update_duty(LEDC_MODE, RED_CH);
+        ledsCleared = true;
+      }
+      vTaskDelay(pdMS_TO_TICKS(40));
+      continue;
+    }
+
+    ledsCleared = false;
     bool sp = showPot;
 
     if (!sp) {
