@@ -20,6 +20,7 @@
 #include "sampling_task.h"
 #include "wifi_captive.h"
 #include "ws_manager.h"
+#include "power_manager.h"
 
 #include <Preferences.h>
 
@@ -137,8 +138,6 @@ const unsigned long GREEN_SHOW_MS = 500;
 const unsigned long BUTTON_DEBOUNCE_MS = 50;
 const unsigned long BUTTON_LONG_PRESS_MS = 3000;
 
-volatile bool devicePowered = true;
-
 static int buttonReading = HIGH;
 static int buttonStableState = HIGH;
 static unsigned long lastButtonChangeMs = 0;
@@ -174,85 +173,6 @@ int broadcastCountWindow = 0;
 unsigned long broadcastWindowStart = 0;
 bool inBackoff = false;
 unsigned long backoffStart = 0;
-
-void forceAllLedsOff() {
-  ledc_set_duty(LEDC_MODE, GREEN_CH, 0);
-  ledc_update_duty(LEDC_MODE, GREEN_CH);
-  ledc_set_duty(LEDC_MODE, BLUE_CH, 0);
-  ledc_update_duty(LEDC_MODE, BLUE_CH);
-  ledc_set_duty(LEDC_MODE, RED_CH, 0);
-  ledc_update_duty(LEDC_MODE, RED_CH);
-}
-
-void resetRuntimeState(unsigned long now) {
-  showPot = false;
-  connectedAt = 0;
-  interacting = false;
-  lastInteractionMillis = now;
-  interactingSince = 0;
-  broadcastInterval = IDLE_BROAD_MS;
-  lastBroadcastTime = now;
-  lastBroadcastRaw = 0;
-  broadcastWindowStart = now;
-  broadcastCountWindow = 0;
-  inBackoff = false;
-  backoffStart = 0;
-}
-
-void connectFromStoredCredentials(unsigned long now) {
-  String storedSsid = prefs.getString("ssid", "");
-  String storedPass = prefs.getString("pass", "");
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  if (storedSsid.length() > 0) {
-    SLog("Connecting to saved network '%s'\n", storedSsid.c_str());
-    WiFi.begin(storedSsid.c_str(), storedPass.c_str());
-    wifiRegisterStaAttempt(now);
-  } else {
-    SLog("No saved credentials - waiting for captive portal\n");
-  }
-}
-
-void devicePowerOff(unsigned long now) {
-  if (!devicePowered) return;
-  SLog("Device powering OFF\n");
-  devicePowered = false;
-  resetRuntimeState(now);
-  wsDropAllClients();
-  wifiClearPendingConnect();
-  wifiResetStaGraceTimer();
-  stopCaptiveAP();
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  requestCpuIdle();
-  forceAllLedsOff();
-}
-
-void devicePowerOn(unsigned long now) {
-  if (devicePowered) return;
-  SLog("Device powering ON\n");
-  devicePowered = true;
-  resetRuntimeState(now);
-  wifiClearPendingConnect();
-  wifiResetStaGraceTimer();
-  requestCpuNormal();
-  lastCpuBoostTime = now;
-  connectFromStoredCredentials(now);
-}
-
-void handleCaptiveLongPress(unsigned long now) {
-  if (!devicePowered) return;
-  SLog("Button D19 long press -> starting captive portal\n");
-  prefs.remove("ssid");
-  prefs.remove("pass");
-  WiFi.disconnect(true);
-  wifiClearPendingConnect();
-  stopCaptiveAP();
-  startCaptiveAP();
-  requestCpuIdle();
-  resetRuntimeState(now);
-  wifiResetStaGraceTimer();
-}
 
 // ---------- setup ----------
 void setup() {
@@ -292,8 +212,7 @@ void setup() {
   startSamplingTask();
 
   unsigned long initNow = millis();
-  resetRuntimeState(initNow);
-  connectFromStoredCredentials(initNow);
+  powerManagerSetup(initNow, IDLE_BROAD_MS);
 
   wsInit();
 
@@ -336,10 +255,10 @@ void loop() {
         buttonLongActionTriggered = false;
       } else {
         if (!buttonLongActionTriggered) {
-          if (devicePowered) {
-            devicePowerOff(now);
+          if (powerIsOn()) {
+            powerTurnOff(now);
           } else {
-            devicePowerOn(now);
+            powerTurnOn(now);
           }
         }
         buttonPressStartMs = 0;
@@ -348,13 +267,13 @@ void loop() {
     }
 
     if (buttonStableState == LOW && !buttonLongActionTriggered &&
-        devicePowered && (now - buttonPressStartMs) >= BUTTON_LONG_PRESS_MS) {
+        powerIsOn() && (now - buttonPressStartMs) >= BUTTON_LONG_PRESS_MS) {
       buttonLongActionTriggered = true;
-      handleCaptiveLongPress(now);
+      powerHandleLongPress(now);
     }
   }
 
-  bool powered = devicePowered;
+  bool powered = powerIsOn();
   static bool offLogged = false;
 
   if (powered) {

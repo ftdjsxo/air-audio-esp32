@@ -9,9 +9,9 @@
 
 #include "sample_data.h"
 #include "led_config.h"
+#include "power_manager.h"
 
 extern volatile bool showPot;
-extern volatile bool devicePowered;
 
 namespace {
 constexpr unsigned long RED_FADE_UPDATE_MS = 40;
@@ -44,7 +44,7 @@ void ledTask(void *pv) {
 
   for (;;) {
     unsigned long now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    bool powered = devicePowered;
+    bool powered = powerIsOn();
 
     if (!powered) {
       if (!ledsCleared) {
