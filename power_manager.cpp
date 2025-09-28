@@ -12,7 +12,7 @@ extern Preferences prefs;
 extern volatile bool showPot;
 extern volatile unsigned long connectedAt;
 extern volatile bool interacting;
-extern unsigned long lastInteractionMillis;
+extern volatile unsigned long lastInteractionMillis;
 extern unsigned long interactingSince;
 extern unsigned long broadcastInterval;
 extern unsigned long lastBroadcastTime;
@@ -35,6 +35,8 @@ void wsDropAllClients();
 namespace {
 volatile bool gDevicePowered = true;
 unsigned long gIdleBroadcastMs = 0;
+constexpr unsigned long POWER_AUTO_OFF_TIMEOUT_MS = 90UL * 60UL * 1000UL;
+unsigned long gLastActivityMs = 0;
 
 void resetRuntimeState(unsigned long now) {
   showPot = false;
@@ -42,19 +44,23 @@ void resetRuntimeState(unsigned long now) {
   interacting = false;
   lastInteractionMillis = now;
   interactingSince = 0;
-  broadcastInterval = gIdleBroadcastMs > 0 ? gIdleBroadcastMs : broadcastInterval;
+  if (gIdleBroadcastMs > 0) {
+    broadcastInterval = gIdleBroadcastMs;
+  }
   lastBroadcastTime = now;
   lastBroadcastRaw = 0;
   broadcastWindowStart = now;
   broadcastCountWindow = 0;
   inBackoff = false;
   backoffStart = 0;
+  gLastActivityMs = now;
 }
 
 void connectFromStoredCredentials(unsigned long now) {
   String storedSsid = prefs.getString("ssid", "");
   String storedPass = prefs.getString("pass", "");
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   if (storedSsid.length() > 0) {
     SLog("Connecting to saved network '%s'\n", storedSsid.c_str());
     WiFi.begin(storedSsid.c_str(), storedPass.c_str());
@@ -114,4 +120,15 @@ void powerHandleLongPress(unsigned long now) {
   requestCpuIdle();
   resetRuntimeState(now);
   wifiResetStaGraceTimer();
+}
+
+void powerManagerTick(unsigned long now) {
+  if (!gDevicePowered) return;
+  if (lastInteractionMillis != 0 && lastInteractionMillis > gLastActivityMs) {
+    gLastActivityMs = lastInteractionMillis;
+  }
+  if (gLastActivityMs != 0 && (now - gLastActivityMs) >= POWER_AUTO_OFF_TIMEOUT_MS) {
+    SLog("Auto power-off after inactivity\n");
+    powerTurnOff(now);
+  }
 }

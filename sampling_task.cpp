@@ -6,11 +6,12 @@
 #include "freertos/task.h"
 
 #include "sample_data.h"
+#include "power_manager.h"
 
 extern const int potPin;
 extern QueueHandle_t sampleQueue;
 extern volatile bool interacting;
-extern unsigned long lastInteractionMillis;
+extern volatile unsigned long lastInteractionMillis;
 extern volatile unsigned long lastCpuBoostTime;
 
 void requestCpuNormal();
@@ -32,6 +33,8 @@ int historyCount = 0;
 constexpr unsigned long HISTORY_WINDOW_MS = 500;
 constexpr int IMMEDIATE_TRIGGER_RAW = 12;
 constexpr int MIN_MOVEMENT_RAW = 10;
+constexpr unsigned long POWERED_OFF_SAMPLE_MS = 1000;
+constexpr float POWER_ACTIVITY_RESET_THRESHOLD = 0.02f; // minimum mean delta (~2%) to count as interaction
 
 void samplingTask(void *pv) {
   (void)pv;
@@ -42,12 +45,18 @@ void samplingTask(void *pv) {
 
   for (;;) {
     unsigned long now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    unsigned long local_sampleInterval = interacting ? INTERACT_SAMPLE_MS : IDLE_SAMPLE_MS;
+    bool powered = powerIsOn();
+    unsigned long local_sampleInterval = powered ? (interacting ? INTERACT_SAMPLE_MS : IDLE_SAMPLE_MS) : POWERED_OFF_SAMPLE_MS;
 
     if (now - local_lastPotSample >= local_sampleInterval) {
       local_lastPotSample = now;
       int raw = analogRead(potPin);
       int deltaRaw = abs(raw - local_potRaw);
+
+      if (!powered && deltaRaw >= MIN_MOVEMENT_RAW) {
+        powerTurnOn(now);
+        powered = true;
+      }
 
       history[historyHead].ts = now;
       history[historyHead].delta = deltaRaw;
@@ -78,14 +87,17 @@ void samplingTask(void *pv) {
       s.ts = now;
       if (sampleQueue) xQueueOverwrite(sampleQueue, &s);
 
-      if (deltaRaw >= MIN_MOVEMENT_RAW) {
+      bool immediateMovement = (deltaRaw >= IMMEDIATE_TRIGGER_RAW);
+      bool meaningfulMovement = (deltaRaw >= MIN_MOVEMENT_RAW) &&
+                                 (immediateMovement || activity >= POWER_ACTIVITY_RESET_THRESHOLD);
+
+      if (meaningfulMovement) {
         lastInteractionMillis = now;
       }
 
-      if (deltaRaw >= IMMEDIATE_TRIGGER_RAW) {
+      if (immediateMovement) {
         immediateConsecutive++;
         if (immediateConsecutive >= 2) {
-          lastInteractionMillis = now;
           requestCpuNormal();
           lastCpuBoostTime = now;
           immediateConsecutive = 0;

@@ -115,7 +115,7 @@ extern const int potPin = 36; // VP (ADC1)
 extern const unsigned long INTERACT_SAMPLE_MS   = 30;
 const unsigned long INTERACT_BROAD_MS    = 120;
 extern const unsigned long IDLE_SAMPLE_MS       = 300;
-const unsigned long IDLE_BROAD_MS        = 1000;
+const unsigned long IDLE_BROAD_MS        = 3500;
 
 // windows and thresholds
 const float ACTIVITY_MIN_FOR_INTERACT = 0.05f;
@@ -164,7 +164,7 @@ int lastBroadcastRaw = 0;
 
 // adaptive runtime
 unsigned long broadcastInterval = IDLE_BROAD_MS;
-unsigned long lastInteractionMillis = 0;
+volatile unsigned long lastInteractionMillis = 0;
 unsigned long interactingSince = 0;
 
 
@@ -272,6 +272,8 @@ void loop() {
       powerHandleLongPress(now);
     }
   }
+
+  powerManagerTick(now);
 
   bool powered = powerIsOn();
   static bool offLogged = false;
