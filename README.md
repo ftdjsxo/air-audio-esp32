@@ -38,6 +38,12 @@ Firmware per un nodo sensore interattivo "Air Volume" basato su ESP32-WROOM-32D.
 > Suggerimento: fuori dall'IDE puoi esportare il binario (`.bin`) ed eseguire il flash con `esptool.py`.
 
 ## Come funziona il firmware
+### Moduli principali
+- `sketch_sep26a.ino`: punto d'ingresso, imposta l'hardware, coordina FreeRTOS, WebSocket e logica adattiva.
+- `led_renderer.cpp/.h`: task dedicato al rendering LED, consuma i campioni dalla coda e mostra stato Wi-Fi o la percentuale del potenziometro.
+- `wifi_captive.cpp/.h`: gestisce captive portal, timer di grazia e tentativi STA, isolando le chiamate a `WiFi`, `DNSServer` e `WebServer` dal loop principale.
+- `sample_data.h` e `led_config.h`: header di condivisione per la coda dei campioni e per le costanti LEDC.
+- `captive_pages.h`: template HTML serviti dal captive portal.
 ### Sequenza di boot (`setup`)
 - Inizializza il logging seriale, la memoria `Preferences` e i pin (timer LEDC, attenuazione ADC, ingresso pulsante).
 - Carica eventuali credenziali Wi-Fi salvate; se presenti tenta la connessione in modalità `WIFI_STA`, altrimenti attende input dell'utente.
@@ -54,10 +60,8 @@ Firmware per un nodo sensore interattivo "Air Volume" basato su ESP32-WROOM-32D.
 - Quando non mostra il potenziometro in tempo reale, il LED indica lo stato Wi-Fi: rosso pulsante in disconnessione, blu "breathing" in ricerca, verde fisso quando collegato.
 - In modalità "show pot" il LED passa gradualmente da verde→blu→rosso in base alla percentuale del potenziometro, aggiornando il duty PWM LEDC.
 
-### Loop principale (`loop`)
 - Gestisce il debounce del pulsante su `D19`. Alla pressione cancella le credenziali Wi-Fi salvate, forza la disconnessione STA e avvia subito il captive portal.
-- Tiene traccia dello stato Wi-Fi: quando connesso chiude il captive portal e mostra il valore del potenziometro; in caso di disconnessione avvia un timer di grazia (`STA_TO_CAPTIVE_DELAY_MS`) prima di aprire il captive AP.
-- Serve il captive portal (`WebServer` + `DNSServer`) quando attivo, permettendo di inserire nuove credenziali SSID/password.
+- Delega l'intero flusso Wi-Fi a `wifiManageState(now)`, che mantiene un timer di grazia, gestisce l'AP captive, avvia i tentativi STA e scala la CPU con `requestCpuNormal()`/`requestCpuIdle()`.
 - Gestisce i client WebSocket:
   - Accetta fino a quattro client, elaborando l'handshake HTTP a blocchi (`MAX_HS_READ_PER_ITER`).
   - Dopo l'upgrade, incapsula payload JSON e li mette in coda per ogni client, rispettando `availableForWrite()` per restare non bloccante.
@@ -65,9 +69,10 @@ Firmware per un nodo sensore interattivo "Air Volume" basato su ESP32-WROOM-32D.
 - Coordina il cambio di frequenza CPU, passando a `NORMAL_CPU_MHZ` durante l'interazione o il lavoro Wi-Fi e tornando a `MIN_IDLE_CPU_MHZ` dopo inattività.
 
 ### Flusso Wi-Fi e captive portal
-- Le credenziali risiedono nel namespace `airvol` di `Preferences`. Il salvataggio via `/save` forza un nuovo tentativo di connessione STA.
-- L'SSID del captive portal `Air Volume` si attiva su pressione del pulsante o allo scadere della grazia dopo una disconnessione inattesa.
-- Durante un tentativo di connessione il loop attende fino a `CONNECT_TRY_TIMEOUT_MS` prima di tornare alla modalità captive. Al successo disattiva l'AP, accende il verde fisso e riprende lo streaming del potenziometro.
+- Le credenziali risiedono nel namespace `airvol` di `Preferences`. Il salvataggio via `/save` (servito da `wifi_captive.cpp`) forza un nuovo tentativo di connessione STA.
+- L'SSID del captive portal `Air Volume` si attiva su pressione del pulsante o allo scadere della grazia (`STA_TO_CAPTIVE_DELAY_MS`) quando la connessione STA cade inaspettatamente.
+- `wifiManageState` mantiene il timer, decide quando attivare/disattivare l'AP, e riporta la CPU a 80 MHz durante l'attesa per limitare il carico radio.
+- Durante un tentativo di connessione il modulo attende fino a `CONNECT_TRY_TIMEOUT_MS` prima di tornare alla modalità captive. Al successo disattiva l'AP, accende il verde fisso e riprende lo streaming del potenziometro.
 
 ### Modalità d'interazione
 - **Idle:** campionamento e broadcast lenti, CPU a 80 MHz, pensata per il funzionamento stabile.
@@ -81,7 +86,11 @@ Firmware per un nodo sensore interattivo "Air Volume" basato su ESP32-WROOM-32D.
 ```
 .
 ├── README.md
-├── sketch_sep26a.ino      # firmware principale
+├── sketch_sep26a.ino      # orchestratore principale
+├── led_renderer.cpp/.h    # task LED e helper
+├── wifi_captive.cpp/.h    # gestione Wi-Fi/captive portal
+├── led_config.h           # costanti LEDC condivise
+├── sample_data.h          # struct Sample_t + coda FreeRTOS
 └── captive_pages.h        # frammenti HTML per il captive portal
 ```
 
