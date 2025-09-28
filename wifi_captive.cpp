@@ -10,6 +10,7 @@
 void SLog(const char *fmt, ...);
 void requestCpuNormal();
 void requestCpuIdle();
+bool wsHasActiveClients();
 
 extern volatile bool showPot;
 extern volatile unsigned long connectedAt;
@@ -32,6 +33,7 @@ bool pendingConnect = false;
 char pendingSSID[64] = "";
 char pendingPASS[64] = "";
 unsigned long connectAttemptStart = 0;
+bool delayingCaptiveForClients = false;
 
 void resetPendingBuffers() {
   pendingSSID[0] = '\0';
@@ -94,6 +96,7 @@ void wifiManageState(unsigned long now) {
 
   if (wifiSt == WL_CONNECTED) {
     staDisconnectAt = 0;
+    delayingCaptiveForClients = false;
     if (apActive) stopCaptiveAP();
     if (!showPot && (now - connectedAt >= GREEN_SHOW_MS)) {
       showPot = true;
@@ -103,19 +106,32 @@ void wifiManageState(unsigned long now) {
   } else {
     if (connectAttemptStart != 0) {
       staDisconnectAt = 0;
+      delayingCaptiveForClients = false;
     } else {
       if (!apActive && !pendingConnect) {
-        if (staDisconnectAt == 0) {
-          staDisconnectAt = now;
-          SLog("STA lost: will wait %lums before enabling captive AP\n", STA_TO_CAPTIVE_DELAY_MS);
-        } else if (now - staDisconnectAt >= STA_TO_CAPTIVE_DELAY_MS) {
-          SLog("STA loss grace expired -> starting captive AP\n");
-          startCaptiveAP();
-          requestCpuIdle();
+        if (wsHasActiveClients()) {
+          if (!delayingCaptiveForClients) {
+            SLog("STA lost but WS clients active -> delaying captive AP\n");
+            delayingCaptiveForClients = true;
+          }
           staDisconnectAt = 0;
+        } else {
+          if (delayingCaptiveForClients) {
+            delayingCaptiveForClients = false;
+          }
+          if (staDisconnectAt == 0) {
+            staDisconnectAt = now;
+            SLog("STA lost: will wait %lums before enabling captive AP\n", STA_TO_CAPTIVE_DELAY_MS);
+          } else if (now - staDisconnectAt >= STA_TO_CAPTIVE_DELAY_MS) {
+            SLog("STA loss grace expired -> starting captive AP\n");
+            startCaptiveAP();
+            requestCpuIdle();
+            staDisconnectAt = 0;
+          }
         }
       } else {
         staDisconnectAt = 0;
+        delayingCaptiveForClients = false;
       }
     }
   }
@@ -127,6 +143,7 @@ void wifiManageState(unsigned long now) {
 
   wifiSt = WiFi.status();
   if (wifiSt == WL_CONNECTED) {
+    delayingCaptiveForClients = false;
     if (!showPot && (now - connectedAt >= GREEN_SHOW_MS)) {
       showPot = true;
       SLog("Switching to POT display mode\n");
@@ -148,6 +165,7 @@ void wifiManageState(unsigned long now) {
     pendingConnect = false;
     resetPendingBuffers();
     staDisconnectAt = 0;
+    delayingCaptiveForClients = false;
   }
 
   if (connectAttemptStart != 0) {
@@ -156,11 +174,13 @@ void wifiManageState(unsigned long now) {
       SLog("STA connect success\n");
       connectAttemptStart = 0;
       apActive = false;
+      delayingCaptiveForClients = false;
     } else if (now - connectAttemptStart >= CONNECT_TRY_TIMEOUT_MS) {
       SLog("STA connect timeout, re-enabling captive AP\n");
       connectAttemptStart = 0;
       startCaptiveAP();
       requestCpuIdle();
+      delayingCaptiveForClients = false;
     }
   }
 }

@@ -179,6 +179,15 @@ static size_t  wsPendingLen[MAX_WS];
 static size_t  wsPendingOff[MAX_WS];
 static bool    wsHasPending[MAX_WS];
 
+bool wsHasActiveClients() {
+  for (int i = 0; i < MAX_WS; ++i) {
+    if (wsClients[i] && wsClients[i].connected()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // broadcast counting for backoff
 int broadcastCountWindow = 0;
 unsigned long broadcastWindowStart = 0;
