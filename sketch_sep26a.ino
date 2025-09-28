@@ -19,6 +19,7 @@
 #include "sample_data.h"
 #include "led_renderer.h"
 #include "led_config.h"
+#include "sampling_task.h"
 #include "wifi_captive.h"
 
 #include <Preferences.h>
@@ -108,19 +109,16 @@ const ledc_channel_t BLUE_CH  = LEDC_CHANNEL_1;
 const ledc_channel_t RED_CH   = LEDC_CHANNEL_2;
 
 // POT
-const int potPin = 36; // VP (ADC1)
+extern const int potPin = 36; // VP (ADC1)
 
 // Interaction / Idle intervals
-const unsigned long INTERACT_SAMPLE_MS   = 30;
+extern const unsigned long INTERACT_SAMPLE_MS   = 30;
 const unsigned long INTERACT_BROAD_MS    = 120;
-const unsigned long IDLE_SAMPLE_MS       = 300;
+extern const unsigned long IDLE_SAMPLE_MS       = 300;
 const unsigned long IDLE_BROAD_MS        = 1000;
 
 // windows and thresholds
-const unsigned long HISTORY_WINDOW_MS = 500;
 const float ACTIVITY_MIN_FOR_INTERACT = 0.05f;
-const int IMMEDIATE_TRIGGER_RAW = 12;
-const int MIN_MOVEMENT_RAW      = 10;
 const unsigned long INTERACT_SUSTAIN_MS = 1200UL;
 const unsigned long INTERACT_MAX_MS = 30000UL;
 
@@ -186,13 +184,6 @@ int broadcastCountWindow = 0;
 unsigned long broadcastWindowStart = 0;
 bool inBackoff = false;
 unsigned long backoffStart = 0;
-
-// ---------- history buffer for deltas (owned by sampling task) ----------
-const int HISTORY_SIZE = 64;
-struct DeltaEntry { unsigned long ts; int delta; };
-DeltaEntry history[HISTORY_SIZE];
-int historyHead = 0;
-int historyCount = 0;
 
 // ---------- helpers ----------
 static inline void base64_encode_static(const uint8_t *data, size_t len, char *out, size_t outlen) {
@@ -327,69 +318,6 @@ static inline void enqueuePayloadForClient(int i, const char *payload, size_t pl
   trySendPending(i);
 }
 
-// ---------- sampling task (high priority) ----------
-void samplingTask(void *pv) {
-  (void) pv;
-  int local_potRaw = analogRead(potPin);
-  unsigned long local_lastPotSample = xTaskGetTickCount() * portTICK_PERIOD_MS;
-  const float inv4095 = 1.0f / 4095.0f;
-  int immediateConsecutive = 0;
-
-  for (;;) {
-    unsigned long now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    unsigned long local_sampleInterval = interacting ? INTERACT_SAMPLE_MS : IDLE_SAMPLE_MS;
-
-    if (now - local_lastPotSample >= local_sampleInterval) {
-      local_lastPotSample = now;
-      int raw = analogRead(potPin);
-      int deltaRaw = abs(raw - local_potRaw);
-
-      history[historyHead].ts = now;
-      history[historyHead].delta = deltaRaw;
-      historyHead = (historyHead + 1) % HISTORY_SIZE;
-      if (historyCount < HISTORY_SIZE) historyCount++;
-
-      unsigned long cutoff = (now > HISTORY_WINDOW_MS) ? (now - HISTORY_WINDOW_MS) : 0;
-      long sum = 0; int cnt = 0;
-      for (int i = 0; i < historyCount; ++i) {
-        int idx = (historyHead - 1 - i + HISTORY_SIZE) % HISTORY_SIZE;
-        if (history[idx].ts >= cutoff) { sum += history[idx].delta; cnt++; } else break;
-      }
-      float activity = 0.0f;
-      if (cnt > 0) activity = ((float)sum / (float)cnt) * inv4095;
-
-      local_potRaw = raw;
-      Sample_t s;
-      s.raw = raw;
-      s.voltage = (float)raw * 3.3f * inv4095;
-      s.percent = (float)raw * 100.0f * inv4095;
-      s.activity = activity;
-      s.ts = now;
-      if (sampleQueue) xQueueOverwrite(sampleQueue, &s);
-
-      // Update lastInteractionMillis for modest movements (keeps original behavior)
-      if (deltaRaw >= MIN_MOVEMENT_RAW) {
-        lastInteractionMillis = now;
-      }
-
-      // For immediate CPU boost require 2 consecutive IMMEDIATE_TRIGGER_RAW samples
-      if (deltaRaw >= IMMEDIATE_TRIGGER_RAW) {
-        immediateConsecutive++;
-        if (immediateConsecutive >= 2) {
-          lastInteractionMillis = now;
-          // boost CPU for responsiveness (user activity)
-          setCpuIfNeeded(NORMAL_CPU_MHZ);
-          lastCpuBoostTime = now;
-          immediateConsecutive = 0;
-        }
-      } else {
-        immediateConsecutive = 0;
-      }
-    }
-    vTaskDelay(pdMS_TO_TICKS(4));
-  }
-}
-
 // ---------- setup ----------
 void setup() {
   #if SERIAL_ENABLED
@@ -401,7 +329,7 @@ void setup() {
   prefs.begin("airvol", false);
 
   // ensure CPU starts at normal speed for initial network attempts
-  setCpuIfNeeded(NORMAL_CPU_MHZ);
+  requestCpuNormal();
   lastCpuBoostTime = millis();
 
   ledc_timer_config_t ledc_timer;
@@ -425,21 +353,7 @@ void setup() {
   ledc_set_duty(LEDC_MODE, BLUE_CH, 0);   ledc_update_duty(LEDC_MODE, BLUE_CH);
   ledc_set_duty(LEDC_MODE, RED_CH, 0);    ledc_update_duty(LEDC_MODE, RED_CH);
 
-  analogSetPinAttenuation(potPin, ADC_11db);
-  analogReadResolution(12);
-  delay(5);
-
-  sampleQueue = xQueueCreate(1, sizeof(Sample_t));
-  int initRaw = analogRead(potPin);
-  if (sampleQueue) {
-    Sample_t ini;
-    ini.raw = initRaw;
-    ini.voltage = (float)initRaw * 3.3f / 4095.0f;
-    ini.percent = (float)initRaw * 100.0f / 4095.0f;
-    ini.activity = 0.0f;
-    ini.ts = millis();
-    xQueueOverwrite(sampleQueue, &ini);
-  }
+  startSamplingTask();
 
   String storedSsid = prefs.getString("ssid", "");
   String storedPass = prefs.getString("pass", "");
@@ -475,8 +389,6 @@ void setup() {
   lastButtonChangeMs = millis();
   buttonHandled = false;
 
-  // sampling sul core 1 (core 1 = APP), alta priorità
-  xTaskCreatePinnedToCore(samplingTask, "sampling", 4096, NULL, 4, NULL, 1); // high prio
   // ledTask su core 1 per evitare contention con Wi-Fi (core 0)
   xTaskCreatePinnedToCore(ledTask, "led", 3072, NULL, 3, NULL, 1);        // med prio -> core 1
 
@@ -622,7 +534,7 @@ void loop() {
       interactingSince = now;
       broadcastInterval = INTERACT_BROAD_MS;
       SLog("Switched to INTERACT mode\n");
-      setCpuIfNeeded(NORMAL_CPU_MHZ);
+      requestCpuNormal();
       lastCpuBoostTime = now;
     } else if (interacting) {
       if ((now - lastInteractionMillis) > INTERACT_SUSTAIN_MS) {
@@ -630,12 +542,12 @@ void loop() {
           interacting = false;
           broadcastInterval = IDLE_BROAD_MS;
           SLog("Interact max timeout -> switch to IDLE\n");
-          setCpuIfNeeded(MIN_IDLE_CPU_MHZ);
+          requestCpuIdle();
         } else {
           interacting = false;
           broadcastInterval = IDLE_BROAD_MS;
           SLog("Sustain expired -> switch to IDLE\n");
-          setCpuIfNeeded(MIN_IDLE_CPU_MHZ);
+          requestCpuIdle();
         }
       }
     }

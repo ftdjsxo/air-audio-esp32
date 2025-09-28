@@ -40,15 +40,17 @@ Firmware per un nodo sensore interattivo "Air Volume" basato su ESP32-WROOM-32D.
 ## Come funziona il firmware
 ### Moduli principali
 - `sketch_sep26a.ino`: punto d'ingresso, imposta l'hardware, coordina FreeRTOS, WebSocket e logica adattiva.
+- `sampling_task.cpp/.h`: inizializza l'ADC del potenziometro, mantiene lo storico dei delta e alimenta la coda FreeRTOS con i campioni.
 - `led_renderer.cpp/.h`: task dedicato al rendering LED, consuma i campioni dalla coda e mostra stato Wi-Fi o la percentuale del potenziometro.
 - `wifi_captive.cpp/.h`: gestisce captive portal, timer di grazia e tentativi STA, isolando le chiamate a `WiFi`, `DNSServer` e `WebServer` dal loop principale.
 - `sample_data.h` e `led_config.h`: header di condivisione per la coda dei campioni e per le costanti LEDC.
 - `captive_pages.h`: template HTML serviti dal captive portal.
 ### Sequenza di boot (`setup`)
-- Inizializza il logging seriale, la memoria `Preferences` e i pin (timer LEDC, attenuazione ADC, ingresso pulsante).
+- Inizializza il logging seriale, apre `Preferences` e configura timer/canali LEDC.
+- Richiama `startSamplingTask()` che calibra l'ADC (attenuazione/risoluzione), crea la coda e avvia `samplingTask` su core 1.
 - Carica eventuali credenziali Wi-Fi salvate; se presenti tenta la connessione in modalità `WIFI_STA`, altrimenti attende input dell'utente.
-- Avvia due task FreeRTOS sul core 1: `samplingTask` (alta priorità) e `ledTask` (media).
 - Avvia il server TCP WebSocket sulla porta 81, disabilita il Wi-Fi sleep e memorizza timestamp di riferimento.
+- Avvia `ledTask` su core 1 per mantenere il rendering disaccoppiato dal Wi-Fi.
 
 ### Pipeline di campionamento (`samplingTask`)
 - Campiona il potenziometro con intervallo variabile a seconda che il dispositivo sia in idle o in modalità interattiva.
@@ -60,6 +62,7 @@ Firmware per un nodo sensore interattivo "Air Volume" basato su ESP32-WROOM-32D.
 - Quando non mostra il potenziometro in tempo reale, il LED indica lo stato Wi-Fi: rosso pulsante in disconnessione, blu "breathing" in ricerca, verde fisso quando collegato.
 - In modalità "show pot" il LED passa gradualmente da verde→blu→rosso in base alla percentuale del potenziometro, aggiornando il duty PWM LEDC.
 
+### Loop principale (`loop`)
 - Gestisce il debounce del pulsante su `D19`. Alla pressione cancella le credenziali Wi-Fi salvate, forza la disconnessione STA e avvia subito il captive portal.
 - Delega l'intero flusso Wi-Fi a `wifiManageState(now)`, che mantiene un timer di grazia, gestisce l'AP captive, avvia i tentativi STA e scala la CPU con `requestCpuNormal()`/`requestCpuIdle()`.
 - Gestisce i client WebSocket:
@@ -86,12 +89,13 @@ Firmware per un nodo sensore interattivo "Air Volume" basato su ESP32-WROOM-32D.
 ```
 .
 ├── README.md
-├── sketch_sep26a.ino      # orchestratore principale
-├── led_renderer.cpp/.h    # task LED e helper
-├── wifi_captive.cpp/.h    # gestione Wi-Fi/captive portal
-├── led_config.h           # costanti LEDC condivise
-├── sample_data.h          # struct Sample_t + coda FreeRTOS
-└── captive_pages.h        # frammenti HTML per il captive portal
+├── sketch_sep26a.ino       # orchestratore principale
+├── sampling_task.cpp/.h    # pipeline di campionamento (ADC + FreeRTOS)
+├── led_renderer.cpp/.h     # task LED e helper
+├── wifi_captive.cpp/.h     # gestione Wi-Fi/captive portal
+├── led_config.h            # costanti LEDC condivise
+├── sample_data.h           # struct Sample_t + coda FreeRTOS
+└── captive_pages.h         # frammenti HTML per il captive portal
 ```
 
 ## Idee future
