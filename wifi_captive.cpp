@@ -6,14 +6,11 @@
 #include <Preferences.h>
 
 #include "captive_pages.h"
+#include "ws_manager.h"
 
 void SLog(const char *fmt, ...);
 void requestCpuNormal();
 void requestCpuIdle();
-bool wsHasActiveClients();
-unsigned long wsGetLastClientActivity();
-void wsDropAllClients();
-
 extern volatile bool showPot;
 extern volatile unsigned long connectedAt;
 extern volatile unsigned long lastCpuBoostTime;

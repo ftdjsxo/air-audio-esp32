@@ -8,8 +8,6 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiClient.h>
-#include <mbedtls/sha1.h>
 #include <driver/ledc.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -21,6 +19,7 @@
 #include "led_config.h"
 #include "sampling_task.h"
 #include "wifi_captive.h"
+#include "ws_manager.h"
 
 #include <Preferences.h>
 
@@ -163,83 +162,6 @@ unsigned long broadcastInterval = IDLE_BROAD_MS;
 unsigned long lastInteractionMillis = 0;
 unsigned long interactingSince = 0;
 
-// WS clients
-const int MAX_WS = 4;
-WiFiClient wsClients[MAX_WS];
-bool wsHandshakeDone[MAX_WS];
-
-// per-client handshake buffer (non-blocking)
-const size_t HS_BUF_SZ = 600;
-char hsBuf[MAX_WS][HS_BUF_SZ];
-size_t hsLen[MAX_WS];
-
-// pending send buffers (one per client)
-static uint8_t wsPendingBuf[MAX_WS][256];
-static size_t  wsPendingLen[MAX_WS];
-static size_t  wsPendingOff[MAX_WS];
-static bool    wsHasPending[MAX_WS];
-static unsigned long wsPendingSince[MAX_WS];
-static unsigned long wsLastProgressMs[MAX_WS];
-static unsigned long wsClientConnectedAt[MAX_WS];
-static unsigned long wsLastClientActivity = 0;
-
-const unsigned long WS_PENDING_STALL_MS = 6000UL;      // drop clients whose tx buffer cannot flush within 6s
-const unsigned long WS_HANDSHAKE_TIMEOUT_MS = 4000UL;  // drop handshakes that never complete within 4s
-
-static void wsResetClientState(int idx);
-void wsDropClient(int idx, const char *reason);
-void wsDropAllClients();
-unsigned long wsGetLastClientActivity();
-
-static inline void wsMarkActivity() {
-  wsLastClientActivity = millis();
-}
-
-unsigned long wsGetLastClientActivity() {
-  return wsLastClientActivity;
-}
-
-bool wsHasActiveClients() {
-  for (int i = 0; i < MAX_WS; ++i) {
-    if (wsClients[i] && wsClients[i].connected()) {
-      return true;
-    }
-  }
-  return false;
-}
-
-static void wsResetClientState(int idx) {
-  if (idx < 0 || idx >= MAX_WS) return;
-  wsHandshakeDone[idx] = false;
-  hsLen[idx] = 0;
-  hsBuf[idx][0] = '\0';
-  wsHasPending[idx] = false;
-  wsPendingLen[idx] = 0;
-  wsPendingOff[idx] = 0;
-  wsPendingSince[idx] = 0;
-  wsLastProgressMs[idx] = 0;
-  wsClientConnectedAt[idx] = 0;
-}
-
-void wsDropClient(int idx, const char *reason) {
-  if (idx < 0 || idx >= MAX_WS) return;
-  bool hadConnection = wsClients[idx] && wsClients[idx].connected();
-  if (wsClients[idx]) {
-    wsClients[idx].stop();
-  }
-  wsClients[idx] = WiFiClient();
-  wsResetClientState(idx);
-  if (reason && hadConnection) {
-    SLog("Dropped client %d: %s\n", idx, reason);
-  }
-}
-
-void wsDropAllClients() {
-  for (int i = 0; i < MAX_WS; ++i) {
-    bool hadConnection = wsClients[i] && wsClients[i].connected();
-    wsDropClient(i, hadConnection ? "forced reset" : NULL);
-  }
-}
 
 // broadcast counting for backoff
 int broadcastCountWindow = 0;
@@ -247,150 +169,6 @@ unsigned long broadcastWindowStart = 0;
 bool inBackoff = false;
 unsigned long backoffStart = 0;
 
-// ---------- helpers ----------
-static inline void base64_encode_static(const uint8_t *data, size_t len, char *out, size_t outlen) {
-  static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  size_t pos = 0;
-  for (size_t j = 0; j < len && pos + 4 < outlen; j += 3) {
-    uint8_t in0 = data[j];
-    uint8_t in1 = (j + 1 < len) ? data[j + 1] : 0;
-    uint8_t in2 = (j + 2 < len) ? data[j + 2] : 0;
-    uint32_t triple = (in0 << 16) | (in1 << 8) | in2;
-    out[pos++] = b64[(triple >> 18) & 0x3F];
-    out[pos++] = b64[(triple >> 12) & 0x3F];
-    out[pos++] = (j + 1 < len) ? b64[(triple >> 6) & 0x3F] : '=';
-    out[pos++] = (j + 2 < len) ? b64[triple & 0x3F] : '=';
-  }
-  out[pos] = '\0';
-}
-
-static inline void computeWebSocketAccept_static(const char *key, char *out, size_t outlen) {
-  const char *GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-  char tmp[128];
-  snprintf(tmp, sizeof(tmp), "%s%s", key, GUID);
-  unsigned char sha1sum[20];
-  mbedtls_sha1((const unsigned char*)tmp, strlen(tmp), sha1sum);
-  base64_encode_static(sha1sum, 20, out, outlen);
-}
-
-// find header value in buf (case-sensitive headerName like "Sec-WebSocket-Key")
-static inline bool findHeaderValueInBuf(const char *buf, const char *headerName, char *out, size_t outlen) {
-  const char *p = strstr(buf, headerName);
-  if (!p) return false;
-  p = strchr(p, ':');
-  if (!p) return false;
-  p++; // skip ':'
-  while (*p == ' ' || *p == '\t') p++;
-  const char *end = strstr(p, "\r\n");
-  if (!end) return false;
-  size_t len = end - p;
-  if (len >= outlen) return false;
-  memcpy(out, p, len);
-  out[len] = '\0';
-  return true;
-}
-
-// --- FIX --- safer ws text send: check availableForWrite for header+payload
-static inline void wsSendTextBufFast(WiFiClient &c, const char *msg, size_t len) {
-  if (!c || !c.connected()) return;
-  int headerLen = 0;
-  uint8_t header[4];
-  if (len <= 125) {
-    header[0] = 0x81; header[1] = (uint8_t)len;
-    headerLen = 2;
-  } else if (len <= 65535) {
-    header[0] = 0x81; header[1] = 126;
-    header[2] = (len >> 8) & 0xFF; header[3] = len & 0xFF;
-    headerLen = 4;
-  } else return;
-
-  #if defined(WIFI_CLIENT_AVAILABLE_FOR_WRITE)
-    int need = headerLen + (int)len;
-    if (c.availableForWrite() < need) return;
-  #endif
-
-  c.write(header, headerLen);
-  c.write((const uint8_t*)msg, len);
-}
-
-// ---------- pending buffer helpers ----------
-static inline void trySendPending(int i) {
-  if (!wsHasPending[i]) return;
-  WiFiClient &c = wsClients[i];
-  if (!c || !c.connected()) {
-    wsDropClient(i, "pending flush lost socket");
-    return;
-  }
-
-  int canWrite = 1024;
-  #if defined(WIFI_CLIENT_AVAILABLE_FOR_WRITE)
-    canWrite = c.availableForWrite();
-  #endif
-  if (canWrite <= 0) return;
-
-  size_t rem = wsPendingLen[i] - wsPendingOff[i];
-  size_t toWrite = rem;
-  if ((size_t)canWrite < toWrite) toWrite = canWrite;
-
-  int written = c.write(wsPendingBuf[i] + wsPendingOff[i], toWrite);
-  if (written > 0) {
-    wsPendingOff[i] += (size_t)written;
-    wsMarkActivity();
-    wsLastProgressMs[i] = millis();
-    if (wsPendingOff[i] >= wsPendingLen[i]) {
-      wsHasPending[i] = false;
-      wsPendingOff[i] = wsPendingLen[i] = 0;
-      wsPendingSince[i] = 0;
-      wsLastProgressMs[i] = 0;
-    }
-  }
-}
-
-static inline void enqueuePayloadForClient(int i, const char *payload, size_t plen) {
-  if (!(wsClients[i] && wsClients[i].connected() && wsHandshakeDone[i])) return;
-  uint8_t header[4];
-  int headerLen = 0;
-  if (plen <= 125) {
-    header[0] = 0x81;
-    header[1] = (uint8_t)plen;
-    headerLen = 2;
-  } else if (plen <= 65535) {
-    header[0] = 0x81;
-    header[1] = 126;
-    header[2] = (plen >> 8) & 0xFF;
-    header[3] = plen & 0xFF;
-    headerLen = 4;
-  } else {
-    size_t maxPayload = sizeof(wsPendingBuf[i]) - 4;
-    if (maxPayload <= 0) return;
-    plen = maxPayload;
-    header[0] = 0x81;
-    header[1] = 126;
-    header[2] = (plen >> 8) & 0x3F;
-    header[3] = plen & 0xFF;
-    headerLen = 4;
-  }
-
-  size_t total = headerLen + plen;
-  if (total > sizeof(wsPendingBuf[i])) {
-    plen = sizeof(wsPendingBuf[i]) - headerLen;
-    total = headerLen + plen;
-  }
-
-  memcpy(wsPendingBuf[i], header, headerLen);
-  memcpy(wsPendingBuf[i] + headerLen, payload, plen);
-  wsPendingLen[i] = total;
-  wsPendingOff[i] = 0;
-  if (!wsHasPending[i]) {
-    unsigned long now = millis();
-    wsPendingSince[i] = now;
-    wsLastProgressMs[i] = now;
-  }
-  wsHasPending[i] = true;
-
-  // try immediate partial send
-  trySendPending(i);
-}
 
 // ---------- setup ----------
 void setup() {
@@ -446,11 +224,7 @@ void setup() {
   showPot = false;
   connectedAt = 0;
 
-  wsServer.begin();
-  SLog("WS (81) started\n");
-  for (int i = 0; i < MAX_WS; ++i) {
-    wsResetClientState(i);
-  }
+  wsInit();
 
   WiFi.setSleep(false);
 
@@ -522,80 +296,7 @@ void loop() {
 
   wifiManageState(now);
 
-  // accept new TCP clients (non-blocking) - DO NOT boost CPU here (avoid probes)
-  WiFiClient newClient = wsServer.available();
-  if (newClient) {
-    int slot = -1;
-    for (int i = 0; i < MAX_WS; ++i) if (!wsClients[i] || !wsClients[i].connected()) { slot = i; break; }
-    if (slot >= 0) {
-      wsClients[slot] = newClient;
-      wsClients[slot].setNoDelay(true);
-      wsResetClientState(slot);
-      wsClientConnectedAt[slot] = now;
-      wsMarkActivity();
-      SLog("New TCP client -> slot %d\n", slot);
-      // do not boost CPU here; only after meaningful activity (sampling etc)
-    } else newClient.stop();
-  }
-
-  // process handshake non-blocking: read available bytes into hsBuf
-  for (int i = 0; i < MAX_WS; ++i) {
-    WiFiClient &c = wsClients[i];
-    if (c && c.connected() && !wsHandshakeDone[i]) {
-      if (wsClientConnectedAt[i] != 0 && (now - wsClientConnectedAt[i]) >= WS_HANDSHAKE_TIMEOUT_MS) {
-        wsDropClient(i, "handshake timeout");
-        continue;
-      }
-      int avail = c.available();
-      if (avail > 0) {
-        int toRead = avail;
-        if (toRead > MAX_HS_READ_PER_ITER) toRead = MAX_HS_READ_PER_ITER; // --- FIX ---
-        while (toRead--) {
-          if (hsLen[i] + 1 < HS_BUF_SZ) {
-            int ch = c.read();
-            if (ch < 0) break;
-            hsBuf[i][hsLen[i]++] = (char)ch;
-            hsBuf[i][hsLen[i]] = '\0';
-          } else {
-            wsDropClient(i, "handshake buffer overflow");
-            break;
-          }
-        }
-      }
-      if (hsLen[i] > 4 && strstr(hsBuf[i], "\r\n\r\n")) {
-        char key[128];
-        if (findHeaderValueInBuf(hsBuf[i], "Sec-WebSocket-Key", key, sizeof(key))) {
-          char accept[128]; computeWebSocketAccept_static(key, accept, sizeof(accept));
-          char resp[256];
-          int n = snprintf(resp, sizeof(resp),
-            "HTTP/1.1 101 Switching Protocols\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            "Sec-WebSocket-Accept: %s\r\n\r\n",
-            accept);
-
-          // --- FIX --- check space before handshake write
-          bool writeOk = true;
-          #if defined(WIFI_CLIENT_AVAILABLE_FOR_WRITE)
-            if (c.availableForWrite() < n) writeOk = false;
-          #endif
-          if (!writeOk) {
-            SLog("Handshake: not enough tx buffer, closing client %d\n", i);
-            wsDropClient(i, "handshake tx backpressure");
-          } else {
-            c.write((const uint8_t*)resp, n);
-            wsHandshakeDone[i] = true;
-            wsMarkActivity();
-            SLog("Handshake done for client %d\n", i);
-            // DO NOT boost CPU here (avoid freq toggles on handshake) -- boost comes from sampling/activity
-            lastCpuBoostTime = millis();
-          }
-        } else { wsDropClient(i, "handshake missing key"); }
-      }
-    } else if (c && !c.connected()) {
-      wsDropClient(i, "socket closed");
-    }
-  }
+  wsTick(now);
 
   // Fetch latest sample (peek single-slot queue)
   Sample_t latest;
@@ -667,30 +368,11 @@ void loop() {
                     "{\"raw\":%d,\"voltage\":%.4f,\"percent\":%.3f,\"activity\":%.4f}",
                     latest.raw, latest.voltage, latest.percent, latest.activity);
 
-        // iterate clients and enqueue payload
-        for (int i = 0; i < MAX_WS; ++i) {
-          WiFiClient &c = wsClients[i];
-          if (c && c.connected() && wsHandshakeDone[i]) {
-            enqueuePayloadForClient(i, payload, (size_t)plen);
-          } else if (c && !c.connected()) {
-            wsDropClient(i, "socket closed");
-          }
-        }
+        wsBroadcastPayload(now, payload, (size_t)plen);
       }
     }
   }
 
-  // try to flush any pending partially-sent frames (non-blocking)
-  for (int i = 0; i < MAX_WS; ++i) if (wsHasPending[i]) trySendPending(i);
-
-  // drop clients whose TX buffers have been stuck for too long (likely Wi-Fi loss)
-  for (int i = 0; i < MAX_WS; ++i) {
-    if (!wsHasPending[i]) continue;
-    unsigned long start = wsLastProgressMs[i] ? wsLastProgressMs[i] : wsPendingSince[i];
-    if (start != 0 && (now - start) >= WS_PENDING_STALL_MS) {
-      wsDropClient(i, "tx stalled");
-    }
-  }
 
   // automatic CPU downscale if we were boosted but nothing relevant happened for a while
   if (currentCpuMhz > MIN_IDLE_CPU_MHZ) {
