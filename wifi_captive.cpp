@@ -11,6 +11,7 @@ void SLog(const char *fmt, ...);
 void requestCpuNormal();
 void requestCpuIdle();
 bool wsHasActiveClients();
+void wsDropAllClients();
 
 extern volatile bool showPot;
 extern volatile unsigned long connectedAt;
@@ -23,6 +24,7 @@ const byte DNS_PORT = 53;
 const unsigned long CONNECT_TRY_TIMEOUT_MS = 10000;
 const unsigned long STA_TO_CAPTIVE_DELAY_MS = CONNECT_TRY_TIMEOUT_MS;
 const unsigned long GREEN_SHOW_MS = 500;
+const unsigned long WS_CLIENT_DISCONNECT_GRACE_MS = 12000;
 
 WebServer captiveServer(80);
 DNSServer dnsServer;
@@ -34,6 +36,7 @@ char pendingSSID[64] = "";
 char pendingPASS[64] = "";
 unsigned long connectAttemptStart = 0;
 bool delayingCaptiveForClients = false;
+unsigned long delayClientsStartedAt = 0;
 
 void resetPendingBuffers() {
   pendingSSID[0] = '\0';
@@ -97,6 +100,7 @@ void wifiManageState(unsigned long now) {
   if (wifiSt == WL_CONNECTED) {
     staDisconnectAt = 0;
     delayingCaptiveForClients = false;
+    delayClientsStartedAt = 0;
     if (apActive) stopCaptiveAP();
     if (!showPot && (now - connectedAt >= GREEN_SHOW_MS)) {
       showPot = true;
@@ -107,17 +111,30 @@ void wifiManageState(unsigned long now) {
     if (connectAttemptStart != 0) {
       staDisconnectAt = 0;
       delayingCaptiveForClients = false;
+      delayClientsStartedAt = 0;
     } else {
       if (!apActive && !pendingConnect) {
-        if (wsHasActiveClients()) {
+        bool hasActiveClients = wsHasActiveClients();
+        if (hasActiveClients) {
           if (!delayingCaptiveForClients) {
             SLog("STA lost but WS clients active -> delaying captive AP\n");
             delayingCaptiveForClients = true;
+            delayClientsStartedAt = now;
+          } else if (delayClientsStartedAt != 0 && (now - delayClientsStartedAt) >= WS_CLIENT_DISCONNECT_GRACE_MS) {
+            SLog("WS clients stalled during STA loss -> dropping connections\n");
+            wsDropAllClients();
+            delayingCaptiveForClients = false;
+            delayClientsStartedAt = 0;
+            hasActiveClients = false;
+            staDisconnectAt = now > STA_TO_CAPTIVE_DELAY_MS ? (now - STA_TO_CAPTIVE_DELAY_MS) : 0;
+          } else {
+            staDisconnectAt = 0;
           }
-          staDisconnectAt = 0;
-        } else {
+        }
+        if (!hasActiveClients) {
           if (delayingCaptiveForClients) {
             delayingCaptiveForClients = false;
+            delayClientsStartedAt = 0;
           }
           if (staDisconnectAt == 0) {
             staDisconnectAt = now;
@@ -132,6 +149,7 @@ void wifiManageState(unsigned long now) {
       } else {
         staDisconnectAt = 0;
         delayingCaptiveForClients = false;
+        delayClientsStartedAt = 0;
       }
     }
   }
@@ -166,6 +184,7 @@ void wifiManageState(unsigned long now) {
     resetPendingBuffers();
     staDisconnectAt = 0;
     delayingCaptiveForClients = false;
+    delayClientsStartedAt = 0;
   }
 
   if (connectAttemptStart != 0) {
@@ -175,12 +194,14 @@ void wifiManageState(unsigned long now) {
       connectAttemptStart = 0;
       apActive = false;
       delayingCaptiveForClients = false;
+      delayClientsStartedAt = 0;
     } else if (now - connectAttemptStart >= CONNECT_TRY_TIMEOUT_MS) {
       SLog("STA connect timeout, re-enabling captive AP\n");
       connectAttemptStart = 0;
       startCaptiveAP();
       requestCpuIdle();
       delayingCaptiveForClients = false;
+      delayClientsStartedAt = 0;
     }
   }
 }

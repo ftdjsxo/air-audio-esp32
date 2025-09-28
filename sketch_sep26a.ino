@@ -178,6 +178,16 @@ static uint8_t wsPendingBuf[MAX_WS][256];
 static size_t  wsPendingLen[MAX_WS];
 static size_t  wsPendingOff[MAX_WS];
 static bool    wsHasPending[MAX_WS];
+static unsigned long wsPendingSince[MAX_WS];
+static unsigned long wsLastProgressMs[MAX_WS];
+static unsigned long wsClientConnectedAt[MAX_WS];
+
+const unsigned long WS_PENDING_STALL_MS = 6000UL;      // drop clients whose tx buffer cannot flush within 6s
+const unsigned long WS_HANDSHAKE_TIMEOUT_MS = 4000UL;  // drop handshakes that never complete within 4s
+
+static void wsResetClientState(int idx);
+void wsDropClient(int idx, const char *reason);
+void wsDropAllClients();
 
 bool wsHasActiveClients() {
   for (int i = 0; i < MAX_WS; ++i) {
@@ -186,6 +196,38 @@ bool wsHasActiveClients() {
     }
   }
   return false;
+}
+
+static void wsResetClientState(int idx) {
+  if (idx < 0 || idx >= MAX_WS) return;
+  wsHandshakeDone[idx] = false;
+  hsLen[idx] = 0;
+  hsBuf[idx][0] = '\0';
+  wsHasPending[idx] = false;
+  wsPendingLen[idx] = 0;
+  wsPendingOff[idx] = 0;
+  wsPendingSince[idx] = 0;
+  wsLastProgressMs[idx] = 0;
+  wsClientConnectedAt[idx] = 0;
+}
+
+void wsDropClient(int idx, const char *reason) {
+  if (idx < 0 || idx >= MAX_WS) return;
+  if (wsClients[idx]) {
+    wsClients[idx].stop();
+  }
+  wsClients[idx] = WiFiClient();
+  wsResetClientState(idx);
+  if (reason) {
+    SLog("Dropped client %d: %s\n", idx, reason);
+  }
+}
+
+void wsDropAllClients() {
+  for (int i = 0; i < MAX_WS; ++i) {
+    bool hadConnection = wsClients[i] && wsClients[i].connected();
+    wsDropClient(i, hadConnection ? "forced reset" : NULL);
+  }
 }
 
 // broadcast counting for backoff
@@ -264,7 +306,10 @@ static inline void wsSendTextBufFast(WiFiClient &c, const char *msg, size_t len)
 static inline void trySendPending(int i) {
   if (!wsHasPending[i]) return;
   WiFiClient &c = wsClients[i];
-  if (!c || !c.connected()) { wsHasPending[i] = false; wsPendingOff[i] = wsPendingLen[i] = 0; return; }
+  if (!c || !c.connected()) {
+    wsDropClient(i, "pending flush lost socket");
+    return;
+  }
 
   int canWrite = 1024;
   #if defined(WIFI_CLIENT_AVAILABLE_FOR_WRITE)
@@ -279,9 +324,12 @@ static inline void trySendPending(int i) {
   int written = c.write(wsPendingBuf[i] + wsPendingOff[i], toWrite);
   if (written > 0) {
     wsPendingOff[i] += (size_t)written;
+    wsLastProgressMs[i] = millis();
     if (wsPendingOff[i] >= wsPendingLen[i]) {
       wsHasPending[i] = false;
       wsPendingOff[i] = wsPendingLen[i] = 0;
+      wsPendingSince[i] = 0;
+      wsLastProgressMs[i] = 0;
     }
   }
 }
@@ -321,6 +369,11 @@ static inline void enqueuePayloadForClient(int i, const char *payload, size_t pl
   memcpy(wsPendingBuf[i] + headerLen, payload, plen);
   wsPendingLen[i] = total;
   wsPendingOff[i] = 0;
+  if (!wsHasPending[i]) {
+    unsigned long now = millis();
+    wsPendingSince[i] = now;
+    wsLastProgressMs[i] = now;
+  }
   wsHasPending[i] = true;
 
   // try immediate partial send
@@ -383,11 +436,7 @@ void setup() {
   wsServer.begin();
   SLog("WS (81) started\n");
   for (int i = 0; i < MAX_WS; ++i) {
-    wsHandshakeDone[i] = false;
-    hsLen[i] = 0;
-    hsBuf[i][0] = '\0';
-    wsPendingLen[i] = wsPendingOff[i] = 0;
-    wsHasPending[i] = false;
+    wsResetClientState(i);
   }
 
   WiFi.setSleep(false);
@@ -467,11 +516,9 @@ void loop() {
     for (int i = 0; i < MAX_WS; ++i) if (!wsClients[i] || !wsClients[i].connected()) { slot = i; break; }
     if (slot >= 0) {
       wsClients[slot] = newClient;
-      wsHandshakeDone[slot] = false;
-      hsLen[slot] = 0;
-      hsBuf[slot][0] = '\0';
       wsClients[slot].setNoDelay(true);
-      wsPendingLen[slot]=wsPendingOff[slot]=0; wsHasPending[slot]=false;
+      wsResetClientState(slot);
+      wsClientConnectedAt[slot] = now;
       SLog("New TCP client -> slot %d\n", slot);
       // do not boost CPU here; only after meaningful activity (sampling etc)
     } else newClient.stop();
@@ -481,6 +528,10 @@ void loop() {
   for (int i = 0; i < MAX_WS; ++i) {
     WiFiClient &c = wsClients[i];
     if (c && c.connected() && !wsHandshakeDone[i]) {
+      if (wsClientConnectedAt[i] != 0 && (now - wsClientConnectedAt[i]) >= WS_HANDSHAKE_TIMEOUT_MS) {
+        wsDropClient(i, "handshake timeout");
+        continue;
+      }
       int avail = c.available();
       if (avail > 0) {
         int toRead = avail;
@@ -492,7 +543,8 @@ void loop() {
             hsBuf[i][hsLen[i]++] = (char)ch;
             hsBuf[i][hsLen[i]] = '\0';
           } else {
-            c.stop(); hsLen[i] = 0; break;
+            wsDropClient(i, "handshake buffer overflow");
+            break;
           }
         }
       }
@@ -515,8 +567,7 @@ void loop() {
           #endif
           if (!writeOk) {
             SLog("Handshake: not enough tx buffer, closing client %d\n", i);
-            c.stop();
-            hsLen[i] = 0;
+            wsDropClient(i, "handshake tx backpressure");
           } else {
             c.write((const uint8_t*)resp, n);
             wsHandshakeDone[i] = true;
@@ -524,10 +575,10 @@ void loop() {
             // DO NOT boost CPU here (avoid freq toggles on handshake) -- boost comes from sampling/activity
             lastCpuBoostTime = millis();
           }
-        } else { c.stop(); hsLen[i]=0; }
+        } else { wsDropClient(i, "handshake missing key"); }
       }
     } else if (c && !c.connected()) {
-      c.stop(); wsHandshakeDone[i] = false; hsLen[i] = 0; wsHasPending[i] = false;
+      wsDropClient(i, "socket closed");
     }
   }
 
@@ -607,7 +658,7 @@ void loop() {
           if (c && c.connected() && wsHandshakeDone[i]) {
             enqueuePayloadForClient(i, payload, (size_t)plen);
           } else if (c && !c.connected()) {
-            c.stop(); wsHandshakeDone[i] = false; wsHasPending[i] = false;
+            wsDropClient(i, "socket closed");
           }
         }
       }
@@ -616,6 +667,15 @@ void loop() {
 
   // try to flush any pending partially-sent frames (non-blocking)
   for (int i = 0; i < MAX_WS; ++i) if (wsHasPending[i]) trySendPending(i);
+
+  // drop clients whose TX buffers have been stuck for too long (likely Wi-Fi loss)
+  for (int i = 0; i < MAX_WS; ++i) {
+    if (!wsHasPending[i]) continue;
+    unsigned long start = wsLastProgressMs[i] ? wsLastProgressMs[i] : wsPendingSince[i];
+    if (start != 0 && (now - start) >= WS_PENDING_STALL_MS) {
+      wsDropClient(i, "tx stalled");
+    }
+  }
 
   // automatic CPU downscale if we were boosted but nothing relevant happened for a while
   if (currentCpuMhz > MIN_IDLE_CPU_MHZ) {
