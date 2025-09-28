@@ -43,13 +43,14 @@ Firmware per un nodo sensore interattivo "Air Volume" basato su ESP32-WROOM-32D.
 - `sampling_task.cpp/.h`: inizializza l'ADC del potenziometro, mantiene lo storico dei delta e alimenta la coda FreeRTOS con i campioni.
 - `led_renderer.cpp/.h`: task dedicato al rendering LED, consuma i campioni dalla coda e mostra stato Wi-Fi o la percentuale del potenziometro.
 - `wifi_captive.cpp/.h`: gestisce captive portal, timer di grazia e tentativi STA, isolando le chiamate a `WiFi`, `DNSServer` e `WebServer` dal loop principale.
+- `ws_manager.cpp/.h`: incapsula il server WebSocket sulla porta 81, curando handshake, buffering non bloccante e disconnessioni automatiche in caso di backpressure o timeout.
 - `sample_data.h` e `led_config.h`: header di condivisione per la coda dei campioni e per le costanti LEDC.
 - `captive_pages.h`: template HTML serviti dal captive portal.
 ### Sequenza di boot (`setup`)
 - Inizializza il logging seriale, apre `Preferences` e configura timer/canali LEDC.
 - Richiama `startSamplingTask()` che calibra l'ADC (attenuazione/risoluzione), crea la coda e avvia `samplingTask` su core 1.
 - Carica eventuali credenziali Wi-Fi salvate; se presenti tenta la connessione in modalità `WIFI_STA`, altrimenti attende input dell'utente.
-- Avvia il server TCP WebSocket sulla porta 81, disabilita il Wi-Fi sleep e memorizza timestamp di riferimento.
+- Invoca `wsInit()` per avviare il server WebSocket sulla porta 81, disabilita il Wi-Fi sleep e memorizza timestamp di riferimento.
 - Avvia `ledTask` su core 1 per mantenere il rendering disaccoppiato dal Wi-Fi.
 
 ### Pipeline di campionamento (`samplingTask`)
@@ -65,10 +66,7 @@ Firmware per un nodo sensore interattivo "Air Volume" basato su ESP32-WROOM-32D.
 ### Loop principale (`loop`)
 - Gestisce il debounce del pulsante su `D19`. Alla pressione cancella le credenziali Wi-Fi salvate, forza la disconnessione STA e avvia subito il captive portal.
 - Delega l'intero flusso Wi-Fi a `wifiManageState(now)`, che mantiene un timer di grazia, gestisce l'AP captive, avvia i tentativi STA e scala la CPU con `requestCpuNormal()`/`requestCpuIdle()`.
-- Gestisce i client WebSocket:
-  - Accetta fino a quattro client, elaborando l'handshake HTTP a blocchi (`MAX_HS_READ_PER_ITER`).
-  - Dopo l'upgrade, incapsula payload JSON e li mette in coda per ogni client, rispettando `availableForWrite()` per restare non bloccante.
-  - L'handshake che non termina entro 4 s o una coda TX bloccata per oltre 6 s causano la chiusura forzata del client, evitando che il loop resti sospeso quando il Wi-Fi è instabile.
+- Delega la gestione WebSocket a `wsTick(now)`, che accetta fino a quattro client, gestisce gli handshake a blocchi e mette in coda i payload JSON rispettando `availableForWrite()`; handshake oltre i 4 s o code TX ferme per 6 s provocano la disconnessione forzata per evitare blocchi del loop.
 - Implementa una cadenza di broadcast adattiva: variazioni significative o heartbeat periodici generano aggiornamenti; troppo traffico attiva un backoff esponenziale.
 - Coordina il cambio di frequenza CPU, passando a `NORMAL_CPU_MHZ` durante l'interazione o il lavoro Wi-Fi e tornando a `MIN_IDLE_CPU_MHZ` dopo inattività.
 
@@ -95,6 +93,7 @@ Firmware per un nodo sensore interattivo "Air Volume" basato su ESP32-WROOM-32D.
 ├── sampling_task.cpp/.h    # pipeline di campionamento (ADC + FreeRTOS)
 ├── led_renderer.cpp/.h     # task LED e helper
 ├── wifi_captive.cpp/.h     # gestione Wi-Fi/captive portal
+├── ws_manager.cpp/.h       # server WebSocket (handshake, buffering, drop)
 ├── led_config.h            # costanti LEDC condivise
 ├── sample_data.h           # struct Sample_t + coda FreeRTOS
 └── captive_pages.h         # frammenti HTML per il captive portal
