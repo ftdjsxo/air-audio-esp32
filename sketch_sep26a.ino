@@ -181,6 +181,7 @@ static bool    wsHasPending[MAX_WS];
 static unsigned long wsPendingSince[MAX_WS];
 static unsigned long wsLastProgressMs[MAX_WS];
 static unsigned long wsClientConnectedAt[MAX_WS];
+static unsigned long wsLastClientActivity = 0;
 
 const unsigned long WS_PENDING_STALL_MS = 6000UL;      // drop clients whose tx buffer cannot flush within 6s
 const unsigned long WS_HANDSHAKE_TIMEOUT_MS = 4000UL;  // drop handshakes that never complete within 4s
@@ -188,6 +189,15 @@ const unsigned long WS_HANDSHAKE_TIMEOUT_MS = 4000UL;  // drop handshakes that n
 static void wsResetClientState(int idx);
 void wsDropClient(int idx, const char *reason);
 void wsDropAllClients();
+unsigned long wsGetLastClientActivity();
+
+static inline void wsMarkActivity() {
+  wsLastClientActivity = millis();
+}
+
+unsigned long wsGetLastClientActivity() {
+  return wsLastClientActivity;
+}
 
 bool wsHasActiveClients() {
   for (int i = 0; i < MAX_WS; ++i) {
@@ -213,12 +223,13 @@ static void wsResetClientState(int idx) {
 
 void wsDropClient(int idx, const char *reason) {
   if (idx < 0 || idx >= MAX_WS) return;
+  bool hadConnection = wsClients[idx] && wsClients[idx].connected();
   if (wsClients[idx]) {
     wsClients[idx].stop();
   }
   wsClients[idx] = WiFiClient();
   wsResetClientState(idx);
-  if (reason) {
+  if (reason && hadConnection) {
     SLog("Dropped client %d: %s\n", idx, reason);
   }
 }
@@ -324,6 +335,7 @@ static inline void trySendPending(int i) {
   int written = c.write(wsPendingBuf[i] + wsPendingOff[i], toWrite);
   if (written > 0) {
     wsPendingOff[i] += (size_t)written;
+    wsMarkActivity();
     wsLastProgressMs[i] = millis();
     if (wsPendingOff[i] >= wsPendingLen[i]) {
       wsHasPending[i] = false;
@@ -423,6 +435,7 @@ void setup() {
   if (storedSsid.length() > 0) {
     SLog("Found saved creds - attempting connect to '%s'\n", storedSsid.c_str());
     WiFi.begin(storedSsid.c_str(), storedPass.c_str());
+    wifiRegisterStaAttempt(millis());
   } else {
     SLog("No saved creds - default auto-connect disabled (no WIFI_SSID). Waiting for user action or captive AP trigger.\n");
     // Do not call WiFi.begin() with a built-in default. Connection will only be attempted
@@ -519,6 +532,7 @@ void loop() {
       wsClients[slot].setNoDelay(true);
       wsResetClientState(slot);
       wsClientConnectedAt[slot] = now;
+      wsMarkActivity();
       SLog("New TCP client -> slot %d\n", slot);
       // do not boost CPU here; only after meaningful activity (sampling etc)
     } else newClient.stop();
@@ -571,6 +585,7 @@ void loop() {
           } else {
             c.write((const uint8_t*)resp, n);
             wsHandshakeDone[i] = true;
+            wsMarkActivity();
             SLog("Handshake done for client %d\n", i);
             // DO NOT boost CPU here (avoid freq toggles on handshake) -- boost comes from sampling/activity
             lastCpuBoostTime = millis();

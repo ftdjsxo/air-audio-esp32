@@ -11,6 +11,7 @@ void SLog(const char *fmt, ...);
 void requestCpuNormal();
 void requestCpuIdle();
 bool wsHasActiveClients();
+unsigned long wsGetLastClientActivity();
 void wsDropAllClients();
 
 extern volatile bool showPot;
@@ -25,6 +26,7 @@ const unsigned long CONNECT_TRY_TIMEOUT_MS = 10000;
 const unsigned long STA_TO_CAPTIVE_DELAY_MS = CONNECT_TRY_TIMEOUT_MS;
 const unsigned long GREEN_SHOW_MS = 500;
 const unsigned long WS_CLIENT_DISCONNECT_GRACE_MS = 12000;
+const unsigned long WS_CLIENT_ACTIVITY_GRACE_MS = 20000;
 
 WebServer captiveServer(80);
 DNSServer dnsServer;
@@ -115,23 +117,32 @@ void wifiManageState(unsigned long now) {
     } else {
       if (!apActive && !pendingConnect) {
         bool hasActiveClients = wsHasActiveClients();
-        if (hasActiveClients) {
+        unsigned long lastWsActivity = wsGetLastClientActivity();
+        bool recentActivity = (lastWsActivity != 0) && ((now - lastWsActivity) <= WS_CLIENT_ACTIVITY_GRACE_MS);
+        bool shouldDelay = hasActiveClients || recentActivity;
+
+        if (shouldDelay) {
           if (!delayingCaptiveForClients) {
-            SLog("STA lost but WS clients active -> delaying captive AP\n");
+            SLog("STA lost but WS clients active/recent -> delaying captive AP\n");
             delayingCaptiveForClients = true;
             delayClientsStartedAt = now;
+            staDisconnectAt = 0;
           } else if (delayClientsStartedAt != 0 && (now - delayClientsStartedAt) >= WS_CLIENT_DISCONNECT_GRACE_MS) {
-            SLog("WS clients stalled during STA loss -> dropping connections\n");
-            wsDropAllClients();
+            if (hasActiveClients) {
+              SLog("WS clients stalled during STA loss -> dropping connections\n");
+              wsDropAllClients();
+              hasActiveClients = false;
+            }
             delayingCaptiveForClients = false;
             delayClientsStartedAt = 0;
-            hasActiveClients = false;
             staDisconnectAt = now > STA_TO_CAPTIVE_DELAY_MS ? (now - STA_TO_CAPTIVE_DELAY_MS) : 0;
+            shouldDelay = false;
           } else {
             staDisconnectAt = 0;
           }
         }
-        if (!hasActiveClients) {
+
+        if (!shouldDelay) {
           if (delayingCaptiveForClients) {
             delayingCaptiveForClients = false;
             delayClientsStartedAt = 0;
@@ -212,6 +223,13 @@ void wifiClearPendingConnect() {
 
 void wifiResetStaGraceTimer() {
   staDisconnectAt = 0;
+}
+
+void wifiRegisterStaAttempt(unsigned long now) {
+  connectAttemptStart = now;
+  staDisconnectAt = 0;
+  delayingCaptiveForClients = false;
+  delayClientsStartedAt = 0;
 }
 
 bool wifiIsCaptiveActive() {

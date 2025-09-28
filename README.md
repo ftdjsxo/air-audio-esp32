@@ -75,7 +75,7 @@ Firmware per un nodo sensore interattivo "Air Volume" basato su ESP32-WROOM-32D.
 ### Flusso Wi-Fi e captive portal
 - Le credenziali risiedono nel namespace `airvol` di `Preferences`. Il salvataggio via `/save` (servito da `wifi_captive.cpp`) forza un nuovo tentativo di connessione STA.
 - L'SSID del captive portal `Air Volume` si attiva su pressione del pulsante o allo scadere della grazia (`STA_TO_CAPTIVE_DELAY_MS`) quando la connessione STA cade inaspettatamente.
-- Se la connessione STA cade mentre sono ancora attivi client WebSocket, il firmware rimanda l'attivazione del captive portal, ma forza la chiusura di quei client dopo ~12 s di stallo per riattivare il captive portal senza bloccare lo streaming.
+- Se la connessione STA cade ma negli ultimi secondi c'erano client WebSocket attivi (anche se appena disconnessi), il firmware posticipa il captive portal: concede ~12 s per il recupero, poi forza la chiusura dei client bloccati e avvia l'AP solo dopo quel periodo per evitare conflitti.
 - `wifiManageState` mantiene il timer, decide quando attivare/disattivare l'AP, e riporta la CPU a 80 MHz durante l'attesa per limitare il carico radio.
 - Durante un tentativo di connessione il modulo attende fino a `CONNECT_TRY_TIMEOUT_MS` prima di tornare alla modalità captive. Al successo disattiva l'AP, accende il verde fisso e riprende lo streaming del potenziometro.
 
